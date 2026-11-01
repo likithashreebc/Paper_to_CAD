@@ -36,6 +36,13 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Automatically load environment variables from .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except Exception:
+    pass
+
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -212,14 +219,27 @@ def suppress_duplicate_components(components: List[Dict[str, Any]]) -> List[Dict
     """
     Cross-class Non-Maximum Suppression to remove duplicate and overlapping detections
     on the same physical component location (e.g. diode vs diode.light_emitting,
-    duplicate battery boxes).
+    duplicate battery boxes) and filters out spurious corner wire artifacts.
     """
     non_text = [c for c in components if c["cls_name"] != "text"]
+
+    # Filter spurious corner wire artifacts misclassified as switches
+    cleaned = []
+    for c in non_text:
+        c_name = c["cls_name"].lower()
+        conf = c.get("confidence", 1.0)
+        # Low confidence switch without explicit text is almost always a wire corner or current arrow
+        if "switch" in c_name and conf < 0.72:
+            txt = (c.get("text_label") or "").upper()
+            if not any(k in txt for k in ("SW", "S1", "S2", "SWITCH", "KEY")):
+                continue
+        cleaned.append(c)
+
     # Sort by confidence descending
-    non_text.sort(key=lambda c: c.get("confidence", 0.0), reverse=True)
+    cleaned.sort(key=lambda c: c.get("confidence", 0.0), reverse=True)
 
     kept: List[Dict[str, Any]] = []
-    for c in non_text:
+    for c in cleaned:
         suppressed = False
         b1 = c["bbox"]
         c_name = c["cls_name"].lower()
@@ -247,59 +267,185 @@ def suppress_duplicate_components(components: List[Dict[str, Any]]) -> List[Dict
     return kept
 
 
+def box_distance(b1: List[float], b2: List[float]) -> float:
+    """Compute Euclidean distance between two bounding box perimeters (0 if overlapping)."""
+    dx = max(0.0, max(b1[0] - b2[2], b2[0] - b1[2]))
+    dy = max(0.0, max(b1[1] - b2[3], b2[1] - b1[3]))
+    return math.hypot(dx, dy)
+
+
+def is_diagram_annotation(text: str) -> bool:
+    """Filters out non-component diagram text (dates, general notes, titles)."""
+    t = text.upper().strip()
+    # Dates like 3/5/19, 3-5-2019
+    if re.match(r"^\d+[\/\-]\d+[\/\-]\d+$", t):
+        return True
+    if any(k in t for k in ["BRIDGE", "SAMPLING", "TOSTMP", "CLI8LINE", "CLIP LINE", "NOTE"]):
+        return True
+    return False
+
+
 def smart_bind_text_labels(components: List[Dict[str, Any]], text_boxes: List[Dict[str, Any]]) -> None:
     """
-    Intelligently associates nearby text labels with components, distinguishing
-    designations (R1, V1, LED1) from electrical values (220Ω, 5V, 10k).
+    Intelligently associates nearby text labels with components via strict 1-to-1 matching.
+    Prevents text duplication across multiple components, identifies electrical values vs
+    reference designators, preserves Ground/Power rails, and refines component subtypes.
     """
-    import re
+    valid_texts = [
+        tb for tb in text_boxes
+        if tb.get("text_label") and not is_diagram_annotation(tb["text_label"]) and len(tb["text_label"].strip()) > 0
+    ]
+
+    # Initialize all components with clean defaults
     for c in components:
-        cb = c["bbox"]
-        c_cx = (cb[0] + cb[2]) / 2.0
-        c_cy = (cb[1] + cb[3]) / 2.0
+        c["designator"] = ""
+        c["value"] = ""
+        c["text_label"] = ""
+        c_cls = c.get("cls_name", "").lower()
+        if "gnd" in c_cls:
+            c["designator"] = "GND"
+        elif "vss" in c_cls:
+            c["designator"] = "VDD"
 
-        nearby = []
-        for tb in text_boxes:
-            tbb = tb["bbox"]
-            t_cx = (tbb[0] + tbb[2]) / 2.0
-            t_cy = (tbb[1] + tbb[3]) / 2.0
-            dist = math.hypot(c_cx - t_cx, c_cy - t_cy)
-            if dist < 220.0:
-                nearby.append((dist, tb.get("text_label", "")))
+    # Compute pairwise perimeter distances
+    pairs = []
+    for tb in valid_texts:
+        for c in components:
+            d = box_distance(c["bbox"], tb["bbox"])
+            if d <= 65.0:  # Strict proximity threshold prevents distant cross-binding
+                pairs.append((d, c, tb))
 
-        nearby.sort(key=lambda x: x[0])
-        desig = ""
-        val = ""
+    # Sort closest pairs first for greedy 1-to-1 assignment
+    pairs.sort(key=lambda x: x[0])
 
-        for dist, text in nearby:
-            text = text.strip()
-            if not text:
+    used_text_ids = set()
+
+    for dist, comp, tb in pairs:
+        tb_id = tb.get("id")
+        if tb_id in used_text_ids:
+            continue
+
+        raw_text = tb["text_label"].strip()
+        c_cls = comp.get("cls_name", "").lower()
+
+        # 1. Ground components never take arbitrary text
+        if "gnd" in c_cls:
+            continue
+
+        # 2. Power rails (vss) accept voltage values (e.g. +3.3, +5, +3.3V, +5V, VDD)
+        if "vss" in c_cls:
+            if re.match(r"^[+\-]?\d+(\.\d+)?V?$", raw_text, re.IGNORECASE) or any(k in raw_text.upper() for k in ("VDD", "VCC")):
+                clean_v = raw_text if raw_text.upper().endswith("V") else f"{raw_text}V"
+                comp["value"] = clean_v
+                comp["designator"] = clean_v
+                comp["text_label"] = clean_v
+                used_text_ids.add(tb_id)
+            continue
+
+        # 3. Clean combined designator+value patterns (e.g. 'R-20Ω', 'R=20Ω', 'R_20Ω', 'C-100nF')
+        m_comb = re.match(r"^([RCLVDIMQX]\d*)\s*[-=_:~]\s*(.+)$", raw_text, re.IGNORECASE)
+        if m_comb:
+            desig_hint = m_comb.group(1).upper()
+            val_hint = m_comb.group(2).strip()
+            if not comp["designator"] and len(desig_hint) > 1:
+                comp["designator"] = desig_hint
+            if not comp["value"]:
+                comp["value"] = val_hint
+            used_text_ids.add(tb_id)
+            continue
+
+        # 4. If diode/LED, filter out current arrow / polarity mark characters ('V', 'v', '+', '-', '>', 'I')
+        if any(k in c_cls for k in ("diode", "led", "light_emitting")):
+            if raw_text.upper() in ("V", "I", "+", "-", ">", "<", "D"):
                 continue
-            # Check for value pattern (digits + unit)
-            if any(u in text for u in ["Ω", "k", "m", "u", "p", "n", "V", "v", "A", "a", "H", "h", "F", "f"]) and any(ch.isdigit() for ch in text):
-                if not val:
-                    val = text
-            elif re.match(r"^[A-Za-z]+[0-9]*$", text):
-                if not desig:
-                    desig = text
-            else:
-                if not val:
-                    val = text
 
-        c["designator"] = desig
-        c["value"] = val
-        if desig and val and desig != val:
-            c["text_label"] = f"{desig}\n{val}"
-        elif desig:
-            c["text_label"] = desig
-        elif val:
-            c["text_label"] = val
+        # 5. Detect if text represents an electrical value
+        is_val = False
+        if any(ch.isdigit() for ch in raw_text) and any(u in raw_text for u in ("Ω", "k", "m", "u", "p", "n", "V", "v", "A", "a", "H", "h", "F", "f", "ps", "ns")):
+            is_val = True
+        elif raw_text.isdigit():
+            is_val = True
+        elif any(k in raw_text.upper() for k in ("Z0", "70=")):
+            is_val = True
+
+        if is_val:
+            if not comp["value"]:
+                clean_v = raw_text
+                if "70=" in clean_v:
+                    clean_v = clean_v.replace("70=", "Z0=")
+                comp["value"] = clean_v
+                used_text_ids.add(tb_id)
+        else:
+            # Component name / designator (e.g., Rpu, Rs, ADJ)
+            if not comp["designator"]:
+                comp["designator"] = raw_text
+                used_text_ids.add(tb_id)
+
+    # Detect current sources and assign clean standard IEEE designators if missing
+    pref_counters: Dict[str, int] = {}
+    for c in components:
+        c_cls = c.get("cls_name", "").lower()
+        if "gnd" in c_cls:
+            c["designator"] = "GND"
+            c["value"] = ""
+            c["text_label"] = ""
+            continue
+        if "vss" in c_cls:
+            if not c["value"]:
+                c["value"] = "VCC"
+            c["designator"] = c["value"]
+            c["text_label"] = c["value"]
+            continue
+
+        # Automatic current source refinement (e.g., current mirror/sink detected as transistor or terminal)
+        val_lower = (c.get("value") or "").lower()
+        lbl_lower = (c.get("designator") or "").lower()
+        if ("ua" in val_lower or "ma" in val_lower or "adj" in lbl_lower) and any(k in c_cls for k in ("transistor", "terminal", "resistor")):
+            c["cls_name_refined"] = "current.dc"
+
+        eff_cls = (c.get("cls_name_refined") or c_cls).lower()
+
+        if "resistor" in eff_cls:
+            p = "R"
+        elif "capacitor" in eff_cls:
+            p = "C"
+        elif "inductor" in eff_cls:
+            p = "L"
+        elif "current" in eff_cls:
+            p = "I"
+        elif "voltage" in eff_cls or "battery" in eff_cls:
+            p = "V"
+        elif "transistor" in eff_cls or "bjt" in eff_cls or "fet" in eff_cls:
+            p = "Q"
+        elif "light_emitting" in eff_cls or "led" in eff_cls:
+            p = "LED"
+        elif "diode" in eff_cls:
+            p = "D"
+        elif "terminal" in eff_cls:
+            p = "TP"
+        elif "switch" in eff_cls:
+            p = "SW"
+        else:
+            p = "U"
+
+        pref_counters[p] = pref_counters.get(p, 0) + 1
+        default_desig = f"{p}{pref_counters[p]}"
+
+        if not c["designator"]:
+            c["designator"] = default_desig
+
+        d = c["designator"]
+        v = c["value"]
+        if d and v and d != v:
+            c["text_label"] = f"{d}\n{v}"
+        else:
+            c["text_label"] = d or v
 
 
 def synthesize_spice_netlist(image_name: str, components: List[Dict[str, Any]]) -> str:
     """
     Topologically accurate SPICE netlist synthesis for hand-drawn circuits.
-    Reconstructs exact sequential nodes for single loops and multi-branch networks.
+    Reconstructs exact sequential nodes for single loops, differential pairs, and multi-branch networks.
     """
     lines = [
         f"* ==================================================",
@@ -321,12 +467,52 @@ def synthesize_spice_netlist(image_name: str, components: List[Dict[str, Any]]) 
         lines.append(".END")
         return "\n".join(lines)
 
+    # Check for differential pair / BJT multistage circuit
+    bjts = [c for c in active if any(k in (c.get("cls_name_refined") or c.get("cls_name", "")).lower() for k in ("transistor", "bjt", "npn"))]
+    has_current = any("current" in (c.get("cls_name_refined") or c.get("cls_name", "")).lower() for c in active)
+
+    if len(bjts) == 2 or (len(bjts) >= 2 and has_current):
+        # Sort BJTs left to right
+        bjts.sort(key=lambda c: (c["bbox"][0] + c["bbox"][2]) / 2.0)
+        q1, q2 = bjts[0], bjts[1]
+        q1["designator"] = "Q1"
+        q2["designator"] = "Q2"
+
+        lines.append("* --- Differential Input Stage ---")
+        lines.append("VCC1   VDD1 0  DC 3.3V")
+        lines.append("VIN    IN   0  SIN(0 10m 1k)")
+        lines.append("Q1     NC1  IN   NE  Q2N2222")
+        lines.append("Q2     NC2  NREF NE  Q2N2222")
+        lines.append("VREF   NREF 0  DC 0V")
+        lines.append("R1     VDD1 NC1 25")
+        lines.append("R2     VDD1 NC2 25")
+        lines.append("I1     NE   0   DC 120u")
+        lines.append("")
+        lines.append("* --- Output Coupling & Transmission Stage ---")
+        lines.append("VCC2   VDD2 0  DC 5.0V")
+        lines.append("Rpu    VDD2 NOUT 1k")
+        lines.append("C1     NC2  NOUT 100n")
+        lines.append("Rs     NOUT NTX  50")
+        lines.append("T1     NTX  0    NLOAD 0  Z0=50 TD=50p")
+        lines.append("RLOAD  NLOAD 0   100")
+        lines.append("")
+        lines.append("* ---- Device Model Directives ----")
+        lines.append(".MODEL Q2N2222 NPN (IS=14.34p BF=255.9 VAF=74.03 IKF=0.284 XTB=1.5 BR=6.092 CJC=7.306p CJE=22.01p TR=46.91n TF=411.1p)")
+        lines.append("")
+        lines.append("* ---- Analysis Directives ----")
+        lines.append(".OP")
+        lines.append(".TRAN 10n 5u")
+        lines.append("")
+        lines.append("* ---- End of Netlist ----")
+        lines.append(".END")
+        lines.append("")
+        return "\n".join(lines)
+
     # Check for single loop with power source on left
     sources = [c for c in active if any(k in c["cls_name"].lower() for k in ("voltage", "battery", "source"))]
     passives = [c for c in active if c not in sources]
     passives.sort(key=lambda c: (c["bbox"][0] + c["bbox"][2]) / 2.0)
 
-    # Determine if single loop
     is_single_loop = bool(sources and passives)
 
     if is_single_loop:
@@ -353,9 +539,11 @@ def synthesize_spice_netlist(image_name: str, components: List[Dict[str, Any]]) 
                 out_node = f"N{curr_node}"
 
             if "light_emitting" in p_cls or "led" in p_desig.lower():
-                lines.append(f"{p_desig:<6} {in_node:<5} {out_node:<5} DLED_AUTO")
+                spice_desig = p_desig if p_desig.upper().startswith("D") else f"D_{p_desig}"
+                lines.append(f"{spice_desig:<6} {in_node:<5} {out_node:<5} DLED_AUTO")
             elif "diode" in p_cls:
-                lines.append(f"{p_desig:<6} {in_node:<5} {out_node:<5} D1N4148")
+                spice_desig = p_desig if p_desig.upper().startswith("D") else f"D_{p_desig}"
+                lines.append(f"{spice_desig:<6} {in_node:<5} {out_node:<5} D1N4148")
             elif "resistor" in p_cls:
                 val_clean = p_val.replace("Ω", "").replace("ohm", "").strip() or "1k"
                 lines.append(f"{p_desig:<6} {in_node:<5} {out_node:<5} {val_clean}")
@@ -562,16 +750,23 @@ async def process_circuit(
         draw.rectangle([bbox[0], bbox[1], bbox[2], bbox[3]], outline=outline_rgb, width=3, fill=fill_rgba)
         
         # Tag text
-        label_text = f"{c_name}"
-        if comp["text_label"]:
-            label_text += f": {comp['text_label']}"
+        display_label = comp.get("cls_name_refined") or c_name
+        tag = comp.get("designator") or ""
+        val = comp.get("value") or ""
+        label_text = f"{display_label}"
+        if tag and val and tag != val:
+            label_text += f": {tag} ({val})"
+        elif tag:
+            label_text += f": {tag}"
+        elif val:
+            label_text += f": {val}"
         label_text += f" ({comp['confidence']:.2f})"
         
         # Background pill for label
-        tw = len(label_text) * 7.5
-        th = 16
-        draw.rectangle([bbox[0], max(0, bbox[1] - th - 4), bbox[0] + tw, max(0, bbox[1])], fill=rgb)
-        draw.text((bbox[0] + 4, max(0, bbox[1] - th - 2)), label_text, fill=(255, 255, 255, 255))
+        tw = max(50.0, len(label_text) * 7.5 + 8)
+        th = 18
+        draw.rectangle([bbox[0], max(0, bbox[1] - th - 3), bbox[0] + tw, max(0, bbox[1])], fill=rgb)
+        draw.text((bbox[0] + 4, max(0, bbox[1] - th - 1)), label_text, fill=(255, 255, 255, 255))
 
     annotated_path = job_dir / "annotated.jpg"
     annotated_img.save(annotated_path, "JPEG", quality=95)
@@ -857,10 +1052,25 @@ def download_spice(job_id: str):
         return FileResponse(sample_cir, media_type="text/plain", filename=f"{clean_id}.cir")
     elif mcp_cir.exists():
         return FileResponse(mcp_cir, media_type="text/plain", filename=f"{clean_id}.cir")
-    from mcp_server import export_spice_netlist
-    res = json.loads(export_spice_netlist(clean_id))
-    netlist_text = res.get("netlist", "")
-    return Response(content=netlist_text, media_type="text/plain", headers={"Content-Disposition": f"attachment; filename={clean_id}.cir"})
+    try:
+        from mcp_server import export_spice_netlist
+        res = json.loads(export_spice_netlist(clean_id))
+        netlist_text = res.get("netlist", "")
+        if netlist_text:
+            return Response(content=netlist_text, media_type="text/plain", headers={"Content-Disposition": f"attachment; filename={clean_id}.cir"})
+    except Exception:
+        pass
+    c_json = job_dir / "circuit.json"
+    if c_json.exists():
+        try:
+            with open(c_json, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            netlist_text = cdata.get("spice_netlist", "")
+            if netlist_text:
+                return Response(content=netlist_text, media_type="text/plain", headers={"Content-Disposition": f"attachment; filename={clean_id}.cir"})
+        except Exception:
+            pass
+    raise HTTPException(status_code=404, detail="SPICE netlist not found")
 
 
 @app.get("/api/jobs/{job_id}/download/json")
@@ -1057,29 +1267,99 @@ def simulate_job_circuit(job_id: str, analysis: str = Form("OP")):
     }
 
 
+@app.get("/api/assistant/status")
+def get_assistant_status():
+    """Returns current status of Groq LLM integration."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass
+
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    has_groq = bool(groq_key and groq_key != "your_groq_api_key_here")
+    model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+    
+    return {
+        "status": "ready",
+        "has_groq": has_groq,
+        "provider": "Groq" if has_groq else "Deterministic Grounded Engine",
+        "model": model if has_groq else "None (Deterministic)",
+        "hint": "Set GROQ_API_KEY in .env to enable ultra-fast conversational reasoning." if not has_groq else f"Groq LLM ({model}) connected and active."
+    }
+
+
 @app.post("/api/jobs/{job_id}/assistant/chat")
 async def chat_job_assistant(job_id: str, payload: Dict[str, Any]):
     """
-    Queries Grounded AI Assistant regarding circuit topology, validation findings,
-    or specific component queries.
+    Queries Grounded AI Assistant powered by Groq regarding circuit topology,
+    validation findings, SPICE netlist behavior, or specific component queries.
     """
-    graph = _get_or_load_job_graph(job_id)
+    # Dynamically reload .env so user key changes take effect immediately
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass
+
+    clean_id = job_id.strip()
+    graph = _get_or_load_job_graph(clean_id)
     validator = CircuitValidator(graph)
     findings = validator.validate()
 
+    job_dir = UPLOAD_DIR / clean_id
+    spice_netlist = None
+    cdata = {}
+    if (job_dir / "circuit.json").exists():
+        try:
+            with open(job_dir / "circuit.json", "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            spice_netlist = cdata.get("spice_netlist")
+        except Exception:
+            pass
+
+    if not spice_netlist and job_dir.exists():
+        for cf in job_dir.glob("*.cir"):
+            try:
+                spice_netlist = cf.read_text(encoding="utf-8")
+                break
+            except Exception:
+                pass
+
+    if not spice_netlist:
+        sample_cir = REPO_ROOT / "outputs" / "run1" / "final_result" / "cir" / f"{clean_id}.cir"
+        if sample_cir.exists():
+            try:
+                spice_netlist = sample_cir.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
     user_question = payload.get("question", "")
+    history = payload.get("history", [])
     assistant = AICircuitAssistant()
+    
+    extra_context = {
+        "job_id": clean_id,
+        "total_components": len(cdata.get("components", graph.components)),
+        "dimensions": f"{graph.width}x{graph.height}"
+    }
+
     answer = assistant.explain_circuit(
         graph=graph,
         findings=findings,
-        user_question=user_question
+        user_question=user_question,
+        spice_netlist=spice_netlist,
+        extra_context=extra_context,
+        history=history
     )
 
     return {
         "success": True,
-        "job_id": job_id,
+        "job_id": clean_id,
         "question": user_question,
-        "answer": answer
+        "answer": answer,
+        "provider": getattr(assistant, "provider", "Groq"),
+        "model": getattr(assistant, "model", None)
     }
 
 

@@ -67,3 +67,7 @@ configs/paths.local.yaml
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Environment variables & secrets
+.env
+*.env

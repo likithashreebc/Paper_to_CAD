@@ -248,6 +248,9 @@ document.addEventListener("DOMContentLoaded", () => {
     [btnShowDual, btnShowSchematic, btnShowSchemdraw, btnShowAnnotated].forEach(b => b && b.classList.remove("active"));
     const cards = document.querySelectorAll(".viewport-card");
     const jobId = currentJobId || currentSample || "cir1";
+    const isPresetSample = Boolean(currentSample && !currentFile && ["cir1","cir2","cir3","cir4","cir5","canonical_led"].includes(currentSample));
+    const sketchSrc = currentResults?.images?.annotated || currentResults?.images?.original || 
+      (isPresetSample ? `/api/samples/image/${jobId}.jpg` : `/api/jobs/${jobId}/annotated?t=${Date.now()}`);
 
     if (activeViewMode === "dual") {
       if (btnShowDual) btnShowDual.classList.add("active");
@@ -255,7 +258,13 @@ document.addEventListener("DOMContentLoaded", () => {
       if (cards[0]) cards[0].style.display = "flex";
       if (cards[1]) cards[1].style.display = "flex";
       if (cadThemeGroup) cadThemeGroup.style.display = "flex";
-      if (sketchDisplayImg) sketchDisplayImg.src = `/api/samples/image/${jobId}.jpg`;
+      if (sketchDisplayImg) {
+        sketchDisplayImg.onerror = () => {
+          sketchDisplayImg.onerror = null;
+          sketchDisplayImg.src = `/api/jobs/${jobId}/original`;
+        };
+        sketchDisplayImg.src = sketchSrc;
+      }
       if (mainDisplayImg) mainDisplayImg.src = `/api/jobs/${jobId}/schematic/${activeCadTheme}?t=${Date.now()}`;
       if (sketchBboxSvg) sketchBboxSvg.style.display = "block";
     } else if (activeViewMode === "schematic") {
@@ -278,7 +287,13 @@ document.addEventListener("DOMContentLoaded", () => {
       if (cards[0]) cards[0].style.display = "flex";
       if (cards[1]) cards[1].style.display = "none";
       if (cadThemeGroup) cadThemeGroup.style.display = "none";
-      if (sketchDisplayImg) sketchDisplayImg.src = `/api/jobs/${jobId}/annotated?t=${Date.now()}`;
+      if (sketchDisplayImg) {
+        sketchDisplayImg.onerror = () => {
+          sketchDisplayImg.onerror = null;
+          sketchDisplayImg.src = `/api/jobs/${jobId}/original`;
+        };
+        sketchDisplayImg.src = currentResults?.images?.annotated || `/api/jobs/${jobId}/annotated?t=${Date.now()}`;
+      }
       if (sketchBboxSvg) sketchBboxSvg.style.display = "block";
     }
   }
@@ -567,6 +582,11 @@ document.addEventListener("DOMContentLoaded", () => {
     currentJobId = sampleName;
     currentSample = sampleName;
 
+    // Start fresh chat session for this circuit!
+    if (typeof startNewChatForCircuit === "function") {
+      startNewChatForCircuit(sampleName, sampleName);
+    }
+
     // 1. Set images
     if (sketchDisplayImg) sketchDisplayImg.src = `/api/samples/image/${sampleName}.jpg`;
     if (mainDisplayImg) mainDisplayImg.src = `/api/jobs/${sampleName}/schematic/${activeCadTheme}?t=${Date.now()}`;
@@ -698,6 +718,17 @@ document.addEventListener("DOMContentLoaded", () => {
       const data = await response.json();
       currentResults = data;
       currentJobId = data.job_id;
+
+      // Start fresh chat session for this newly synthesized circuit!
+      if (typeof startNewChatForCircuit === "function") {
+        const compCount = (data.components || []).length;
+        const circLabel = data.image_name || data.job_id;
+        startNewChatForCircuit(
+          data.job_id,
+          circLabel,
+          `✨ <strong>New chat started for your uploaded schematic:</strong> <code>${circLabel}</code> (${compCount} components detected).<br>Ask me anything about components, node connections, or simulation behavior!`
+        );
+      }
 
       updateProgress(100, "step-spice");
       setTimeout(() => {
@@ -1253,13 +1284,280 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  // AI Assistant Chat Handlers
-  promptChips.forEach(chip => {
-    chip.addEventListener("click", () => {
-      aiQuestionInput.value = chip.getAttribute("data-q");
-      sendAIMessage();
+  // --------------------------------------------------------------------------
+  // AI Assistant & Past Chats Handlers
+  // --------------------------------------------------------------------------
+  const aiHistorySidebar = document.getElementById("aiHistorySidebar");
+  const togglePastChatsBtn = document.getElementById("togglePastChatsBtn");
+  const newChatBtn = document.getElementById("newChatBtn");
+  const clearAllHistoryBtn = document.getElementById("clearAllHistoryBtn");
+  const pastChatsList = document.getElementById("pastChatsList");
+  const pastChatsCount = document.getElementById("pastChatsCount");
+  const historySearchInput = document.getElementById("historySearchInput");
+  const aiActiveCircuitBadge = document.getElementById("aiActiveCircuitBadge");
+  const aiActiveCircuitName = document.getElementById("aiActiveCircuitName");
+
+  let aiChatHistory = [];
+  let currentChatSessionId = null;
+  let currentChatCircuitId = "cir1";
+  let currentChatCircuitTitle = "cir1";
+  let pastChatSessions = [];
+
+  function loadPastChatsFromStorage() {
+    try {
+      const raw = localStorage.getItem("paper2cad_past_chats");
+      pastChatSessions = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(pastChatSessions)) pastChatSessions = [];
+    } catch (e) {
+      console.warn("Could not load past chats from storage:", e);
+      pastChatSessions = [];
+    }
+    updatePastChatsCountBadge();
+    renderPastChatsList();
+  }
+
+  function savePastChatsToStorage() {
+    try {
+      localStorage.setItem("paper2cad_past_chats", JSON.stringify(pastChatSessions));
+    } catch (e) {
+      console.warn("Could not save past chats to storage:", e);
+    }
+    updatePastChatsCountBadge();
+  }
+
+  function updatePastChatsCountBadge() {
+    if (pastChatsCount) {
+      pastChatsCount.textContent = pastChatSessions.length;
+    }
+  }
+
+  function formatSessionTime(dateObj) {
+    try {
+      const d = new Date(dateObj);
+      const now = new Date();
+      const isToday = d.toDateString() === now.toDateString();
+      const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (isToday) return `Today ${timeStr}`;
+      return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${timeStr}`;
+    } catch (e) {
+      return "Recent";
+    }
+  }
+
+  function saveCurrentChatSession() {
+    if (!currentChatSessionId) return;
+    if (!aiChatHistory || aiChatHistory.length === 0) return;
+
+    const firstUserMsg = aiChatHistory.find(m => m.role === "user");
+    const previewText = firstUserMsg ? firstUserMsg.content : "Circuit Q&A session";
+
+    const sessionData = {
+      id: currentChatSessionId,
+      circuitId: currentChatCircuitId || currentJobId || "cir1",
+      circuitTitle: currentChatCircuitTitle || currentJobId || "cir1",
+      timestamp: Date.now(),
+      formattedTime: formatSessionTime(new Date()),
+      preview: previewText.length > 55 ? previewText.slice(0, 55) + "..." : previewText,
+      history: [...aiChatHistory],
+      threadHtml: aiChatThread ? aiChatThread.innerHTML : ""
+    };
+
+    const existingIdx = pastChatSessions.findIndex(s => s.id === currentChatSessionId);
+    if (existingIdx >= 0) {
+      pastChatSessions[existingIdx] = sessionData;
+    } else {
+      pastChatSessions.unshift(sessionData);
+    }
+
+    if (pastChatSessions.length > 50) {
+      pastChatSessions = pastChatSessions.slice(0, 50);
+    }
+
+    savePastChatsToStorage();
+    renderPastChatsList();
+  }
+
+  function startNewChatForCircuit(circuitId, circuitTitle, welcomeCustomHtml = null) {
+    // 1. Archive previous session if it has user messages
+    saveCurrentChatSession();
+
+    // 2. Set up fresh session
+    currentChatCircuitId = circuitId || "cir1";
+    currentChatCircuitTitle = circuitTitle || circuitId || "cir1";
+    currentChatSessionId = "session_" + Date.now();
+    aiChatHistory = [];
+
+    // 3. Update active circuit pill in header
+    if (aiActiveCircuitName) {
+      aiActiveCircuitName.textContent = currentChatCircuitTitle;
+    }
+
+    // 4. Reset chat thread with clean greeting
+    if (aiChatThread) {
+      const defaultGreeting = `✨ <strong>New chat started for circuit:</strong> <code>${currentChatCircuitTitle}</code>.<br>I have loaded verified topology and components for this schematic. Ask me anything about components, connected nodes, or electrical behavior!`;
+      aiChatThread.innerHTML = `
+        <div class="ai-message assistant">
+          <div class="msg-avatar"><i class="fa-solid fa-robot"></i></div>
+          <div class="msg-body">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+              <strong>Paper2CAD Assistant</strong>
+            </div>
+            <div>${welcomeCustomHtml || defaultGreeting}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    renderPastChatsList();
+  }
+
+  function restorePastChatSession(sessionId) {
+    saveCurrentChatSession();
+
+    const session = pastChatSessions.find(s => s.id === sessionId);
+    if (!session) return;
+
+    currentChatSessionId = session.id;
+    currentChatCircuitId = session.circuitId;
+    currentChatCircuitTitle = session.circuitTitle;
+    currentJobId = session.circuitId;
+    aiChatHistory = session.history ? [...session.history] : [];
+
+    if (aiActiveCircuitName) {
+      aiActiveCircuitName.textContent = session.circuitTitle;
+    }
+
+    if (aiChatThread) {
+      aiChatThread.innerHTML = session.threadHtml || `
+        <div class="ai-message assistant">
+          <div class="msg-avatar"><i class="fa-solid fa-robot"></i></div>
+          <div class="msg-body">
+            <strong>Paper2CAD Assistant</strong>
+            <p>Loaded archived chat for <strong>${session.circuitTitle}</strong>.</p>
+          </div>
+        </div>
+      `;
+      aiChatThread.scrollTop = aiChatThread.scrollHeight;
+    }
+
+    renderPastChatsList();
+    showToast(`Loaded chat for: ${session.circuitTitle}`);
+  }
+
+  function deletePastChatSession(sessionId, event) {
+    if (event) event.stopPropagation();
+    pastChatSessions = pastChatSessions.filter(s => s.id !== sessionId);
+    savePastChatsToStorage();
+
+    if (currentChatSessionId === sessionId) {
+      const activeCirc = currentJobId || currentSample || "cir1";
+      startNewChatForCircuit(activeCirc, activeCirc);
+    } else {
+      renderPastChatsList();
+    }
+    showToast("Past chat removed.");
+  }
+
+  function clearAllPastChatSessions() {
+    if (pastChatSessions.length === 0) return;
+    if (!confirm("Are you sure you want to clear all past chats?")) return;
+    pastChatSessions = [];
+    savePastChatsToStorage();
+    renderPastChatsList();
+    showToast("All past chats cleared.");
+  }
+
+  function renderPastChatsList(filterQuery = "") {
+    if (!pastChatsList) return;
+
+    let sessionsToRender = pastChatSessions;
+    if (filterQuery) {
+      const q = filterQuery.toLowerCase();
+      sessionsToRender = pastChatSessions.filter(s =>
+        (s.circuitTitle && s.circuitTitle.toLowerCase().includes(q)) ||
+        (s.preview && s.preview.toLowerCase().includes(q))
+      );
+    }
+
+    if (sessionsToRender.length === 0) {
+      pastChatsList.innerHTML = `
+        <div class="history-empty">
+          <i class="fa-solid fa-comments"></i>
+          <p>${filterQuery ? 'No matching past chats found.' : 'No saved conversations yet.'}</p>
+          <span>Chats are archived here as you analyze circuits.</span>
+        </div>
+      `;
+      return;
+    }
+
+    pastChatsList.innerHTML = "";
+    sessionsToRender.forEach(session => {
+      const isActive = session.id === currentChatSessionId;
+      const item = document.createElement("div");
+      item.className = `history-session-item ${isActive ? 'active' : ''}`;
+      item.title = `Click to load chat for ${session.circuitTitle}`;
+      item.innerHTML = `
+        <div class="session-item-top">
+          <span class="session-circuit-badge"><i class="fa-solid fa-microchip"></i> ${session.circuitTitle}</span>
+          <span class="session-time">${session.formattedTime || ''}</span>
+        </div>
+        <div class="session-item-bottom">
+          <span class="session-preview">${session.preview || 'Circuit conversation'}</span>
+          <button class="session-delete-btn" title="Delete conversation"><i class="fa-solid fa-trash-can"></i></button>
+        </div>
+      `;
+
+      item.addEventListener("click", () => {
+        restorePastChatSession(session.id);
+      });
+
+      const delBtn = item.querySelector(".session-delete-btn");
+      if (delBtn) {
+        delBtn.addEventListener("click", (e) => {
+          deletePastChatSession(session.id, e);
+        });
+      }
+
+      pastChatsList.appendChild(item);
     });
-  });
+  }
+
+  // Header and controls listeners
+  if (newChatBtn) {
+    newChatBtn.addEventListener("click", () => {
+      const activeCirc = currentJobId || currentSample || "cir1";
+      startNewChatForCircuit(activeCirc, activeCirc);
+      showToast(`Started new chat for ${activeCirc}`);
+    });
+  }
+
+  if (togglePastChatsBtn && aiHistorySidebar) {
+    togglePastChatsBtn.addEventListener("click", () => {
+      aiHistorySidebar.classList.toggle("collapsed");
+      togglePastChatsBtn.classList.toggle("active");
+    });
+  }
+
+  if (clearAllHistoryBtn) {
+    clearAllHistoryBtn.addEventListener("click", clearAllPastChatSessions);
+  }
+
+  if (historySearchInput) {
+    historySearchInput.addEventListener("input", (e) => {
+      renderPastChatsList(e.target.value.trim());
+    });
+  }
+
+  if (promptChips && promptChips.length > 0) {
+    promptChips.forEach(chip => {
+      chip.addEventListener("click", () => {
+        if (aiQuestionInput) {
+          aiQuestionInput.value = chip.getAttribute("data-q") || "";
+          sendAIMessage();
+        }
+      });
+    });
+  }
 
   if (aiSendBtn) {
     aiSendBtn.addEventListener("click", sendAIMessage);
@@ -1267,16 +1565,39 @@ document.addEventListener("DOMContentLoaded", () => {
 
   if (aiQuestionInput) {
     aiQuestionInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") sendAIMessage();
+      if (e.key === "Enter") {
+        e.preventDefault();
+        sendAIMessage();
+      }
     });
   }
 
-  async function sendAIMessage() {
-    const q = aiQuestionInput.value.trim();
-    if (!q || !currentJobId) {
-      if (!currentJobId) showToast("Please analyze a circuit diagram first.");
-      return;
+  // Check Groq / LLM assistant backend status on load
+  async function checkAssistantStatus() {
+    try {
+      const res = await fetch("/api/assistant/status");
+      const data = await res.json();
+      const statusEl = document.getElementById("aiStatusIndicator");
+      if (statusEl) {
+        if (data.has_groq) {
+          const modelName = data.model || "Groq LLM";
+          statusEl.innerHTML = `<span class="badge-groq-active" title="${data.hint}"><i class="fa-solid fa-bolt"></i> Groq Active (${modelName})</span>`;
+        } else {
+          statusEl.innerHTML = `<span class="badge-groq-pending" title="${data.hint}"><i class="fa-solid fa-circle-info"></i> Local Engine (Add GROQ_API_KEY in .env)</span>`;
+        }
+      }
+    } catch (e) {
+      console.warn("Could not check assistant status:", e);
     }
+  }
+  checkAssistantStatus();
+
+  async function sendAIMessage() {
+    if (!aiQuestionInput) return;
+    const q = aiQuestionInput.value.trim();
+    if (!q) return;
+
+    const targetJobId = currentChatCircuitId || currentJobId || currentSample || "cir1";
 
     // Append user message
     appendChatMessage("user", q);
@@ -1284,19 +1605,37 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // Show temporary typing bubble
     const typingId = "typing-" + Date.now();
-    appendChatMessage("assistant", '<i class="fa-solid fa-spinner fa-spin"></i> Analyzing circuit data...', typingId);
+    appendChatMessage("assistant", '<i class="fa-solid fa-spinner fa-spin"></i> Groq AI is analyzing circuit diagram...', typingId);
 
     try {
-      const res = await fetch(`/api/jobs/${currentJobId}/assistant/chat`, {
+      const res = await fetch(`/api/jobs/${targetJobId}/assistant/chat`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({question: q})
+        body: JSON.stringify({
+          question: q,
+          history: aiChatHistory
+        })
       });
       const data = await res.json();
       const typingEl = document.getElementById(typingId);
       if (typingEl) typingEl.remove();
 
-      appendChatMessage("assistant", data.answer || "No response received.");
+      const answer = data.answer || "No response received.";
+      const providerBadge = data.provider ? `<span class="ai-provider-pill"><i class="fa-solid fa-bolt"></i> ${data.provider}${data.model ? ' • ' + data.model : ''}</span>` : '';
+      appendChatMessage("assistant", answer, null, providerBadge);
+
+      // Record in conversation history for multi-turn reasoning
+      aiChatHistory.push({ role: "user", content: q });
+      aiChatHistory.push({ role: "assistant", content: answer });
+      if (aiChatHistory.length > 12) {
+        aiChatHistory = aiChatHistory.slice(-12);
+      }
+
+      // Automatically archive this conversation to Past Chats
+      saveCurrentChatSession();
+
+      // Re-check status in case user just updated .env
+      checkAssistantStatus();
     } catch (err) {
       const typingEl = document.getElementById(typingId);
       if (typingEl) typingEl.remove();
@@ -1304,16 +1643,114 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  function appendChatMessage(sender, htmlText, elementId = null) {
+  // Initialize Past Chats and active circuit session on load
+  loadPastChatsFromStorage();
+  startNewChatForCircuit(currentSample || "cir1", currentSample || "cir1");
+
+  function formatAIMarkdown(text) {
+    if (!text) return "";
+
+    // 1. Stash and protect code blocks
+    const codeBlocks = [];
+    let cleanText = text.replace(/```(?:[a-z]*\n)?([\s\S]*?)```/g, (match, p1) => {
+      const id = `__CODE_BLOCK_${codeBlocks.length}__`;
+      codeBlocks.push(`<pre class="ai-code-block"><code>${p1.trim().replace(/</g, "&lt;").replace(/>/g, "&gt;")}</code></pre>`);
+      return id;
+    });
+
+    // 2. Clean LaTeX math symbols and strip $ delimiters
+    cleanText = cleanText
+      .replace(/\\times/g, " * ")
+      .replace(/\\cdot/g, " * ")
+      .replace(/\\Omega/g, " Ω")
+      .replace(/\\mu/g, "µ")
+      .replace(/\\to/g, " -> ")
+      .replace(/\\infty/g, "∞")
+      .replace(/\\approx/g, "≈")
+      .replace(/\\le\b/g, "<=")
+      .replace(/\\ge\b/g, ">=")
+      .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, "($1 / $2)")
+      .replace(/\$\$([\s\S]*?)\$\$/g, "$1")
+      .replace(/\$([^\$\n]+)\$/g, "$1");
+
+    // 3. Clean raw # before component IDs
+    cleanText = cleanText
+      .replace(/\bComp(?:onent)?\s*#(\d+)\b/gi, "Component $1")
+      .replace(/\bNode\s*#(\d+)\b/gi, "Node $1")
+      .replace(/\b(Resistor|Inductor|Capacitor|Source|Diode)\s*#(\d+)\b/gi, "$1 $2");
+
+    // 4. Sanitize HTML tags except our placeholders
+    let html = cleanText
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+    // 5. Inline code `code`
+    html = html.replace(/`([^`\n]+)`/g, '<code class="ai-inline-code">$1</code>');
+
+    // 6. Bold **text** and Italic *text*
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+    // 7. Headings (#### h5 down to # h2)
+    html = html.replace(/^####\s+(.*$)/gim, '<h5 class="ai-heading-4">$1</h5>');
+    html = html.replace(/^###\s+(.*$)/gim, '<h4 class="ai-heading-3">$1</h4>');
+    html = html.replace(/^##\s+(.*$)/gim, '<h3 class="ai-heading-2">$1</h3>');
+    html = html.replace(/^#\s+(.*$)/gim, '<h2 class="ai-heading-1">$1</h2>');
+
+    // 8. Blockquotes > quote
+    html = html.replace(/^\>\s*(.*$)/gim, '<blockquote class="ai-blockquote">$1</blockquote>');
+
+    // 9. Markdown tables
+    html = html.replace(/((?:^\|[^\n]+\|\r?\n?)+)/gm, (match) => {
+      const lines = match.trim().split(/\r?\n/).filter(l => l.trim().startsWith('|'));
+      if (lines.length < 2) return match;
+      let tableHtml = '<table class="ai-table">';
+      lines.forEach((line, idx) => {
+        const cells = line.split('|').slice(1, -1).map(c => c.trim());
+        if (cells.every(c => /^[-:\s]+$/.test(c))) return;
+        if (idx === 0) {
+          tableHtml += '<thead><tr>' + cells.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
+        } else {
+          tableHtml += '<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>';
+        }
+      });
+      tableHtml += '</tbody></table>';
+      return tableHtml;
+    });
+
+    // 10. Unordered lists - item
+    html = html.replace(/^\s*[-*]\s+(.*$)/gim, '<li class="ai-list-item">$1</li>');
+
+    // 11. Horizontal rule ---
+    html = html.replace(/^---$/gim, '<hr class="ai-hr">');
+
+    // 12. Newlines to <br>
+    html = html.replace(/\n/g, '<br>');
+
+    // 13. Restore code blocks
+    codeBlocks.forEach((block, idx) => {
+      html = html.replace(`__CODE_BLOCK_${idx}__`, block);
+    });
+
+    return html;
+  }
+
+  function appendChatMessage(sender, rawText, elementId = null, extraBadge = "") {
+    if (!aiChatThread) return;
     const msg = document.createElement("div");
     msg.className = `ai-message ${sender}`;
     if (elementId) msg.id = elementId;
     const isBot = sender === "assistant";
+    const bodyContent = isBot ? formatAIMarkdown(rawText) : rawText.replace(/\n/g, '<br>');
     msg.innerHTML = `
       <div class="msg-avatar"><i class="fa-solid ${isBot ? 'fa-robot' : 'fa-user'}"></i></div>
       <div class="msg-body">
-        <strong>${isBot ? 'Paper2CAD Assistant' : 'You'}</strong>
-        <div>${htmlText.replace(/\n/g, '<br>')}</div>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+          <strong>${isBot ? 'Paper2CAD Assistant' : 'You'}</strong>
+          ${extraBadge}
+        </div>
+        <div>${bodyContent}</div>
       </div>
     `;
     aiChatThread.appendChild(msg);

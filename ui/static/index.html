@@ -481,37 +481,93 @@
       <!-- Tab Content 4: Grounded AI Circuit Assistant -->
       <div class="tab-pane" id="tab-ai">
         <div class="ai-assistant-container">
-          <div class="ai-quick-prompts">
-            <span class="quick-prompt-label"><i class="fa-solid fa-bolt"></i> Quick Queries:</span>
-            <button class="prompt-chip" data-q="Explain the overall circuit topology and how it operates.">
-              Circuit Overview
-            </button>
-            <button class="prompt-chip" data-q="What components are connected to Ground (Node 0)?">
-              Ground Connections
-            </button>
-            <button class="prompt-chip" data-q="Explain why any warnings were flagged and how to resolve them.">
-              Explain Warnings
-            </button>
-            <button class="prompt-chip" data-q="List all active components and their connectivity.">
-              Components & Pins
-            </button>
-          </div>
-
-          <div class="ai-chat-thread" id="aiChatThread">
-            <div class="ai-message assistant">
-              <div class="msg-avatar"><i class="fa-solid fa-robot"></i></div>
-              <div class="msg-body">
-                <strong>Paper2CAD Assistant</strong>
-                <p>Hello! I inspect your hand-drawn circuit using verified graph topology and components. Ask me anything about components, connected nodes, or electrical behavior.</p>
+          <div class="ai-header-strip">
+            <div class="ai-header-title">
+              <i class="fa-solid fa-brain"></i>
+              <span>Paper2CAD Grounded Circuit Intelligence</span>
+              <span class="active-circuit-pill" id="aiActiveCircuitBadge" title="Currently Active Circuit Diagram">
+                <i class="fa-solid fa-microchip"></i> <span id="aiActiveCircuitName">cir1</span>
+              </span>
+            </div>
+            <div class="ai-header-actions">
+              <button class="btn-ai-header" id="newChatBtn" title="Start a fresh chat for this circuit">
+                <i class="fa-solid fa-plus"></i> New Chat
+              </button>
+              <button class="btn-ai-header active" id="togglePastChatsBtn" title="Toggle Past Chats Sidebar">
+                <i class="fa-solid fa-clock-rotate-left"></i> Past Chats <span class="badge-count" id="pastChatsCount">0</span>
+              </button>
+              <div class="ai-status-indicator" id="aiStatusIndicator">
+                <span class="badge-groq-pending"><i class="fa-solid fa-bolt"></i> Checking LLM Backend...</span>
               </div>
             </div>
           </div>
 
-          <div class="ai-input-bar">
-            <input type="text" id="aiQuestionInput" placeholder="Ask about this circuit (e.g. 'What is connected to component #0?')...">
-            <button class="btn-send-ai" id="aiSendBtn">
-              <i class="fa-solid fa-paper-plane"></i> Ask
-            </button>
+          <!-- Main Layout: Past Chats Sidebar + Active Chat View -->
+          <div class="ai-main-layout">
+            <!-- Collapsible Past Chats Sidebar -->
+            <aside class="ai-history-sidebar" id="aiHistorySidebar">
+              <div class="history-sidebar-header">
+                <div class="history-sidebar-title">
+                  <i class="fa-solid fa-clock-rotate-left"></i>
+                  <span>Past Chats</span>
+                </div>
+                <button class="btn-history-clear" id="clearAllHistoryBtn" title="Clear all past chats">
+                  <i class="fa-solid fa-trash-can"></i> Clear All
+                </button>
+              </div>
+
+              <div class="history-search-box">
+                <i class="fa-solid fa-magnifying-glass"></i>
+                <input type="text" id="historySearchInput" placeholder="Search chats by circuit or question...">
+              </div>
+
+              <div class="history-sessions-list" id="pastChatsList">
+                <div class="history-empty">
+                  <i class="fa-solid fa-comments"></i>
+                  <p>No saved conversations yet.</p>
+                  <span>Chats are saved as you analyze circuits.</span>
+                </div>
+              </div>
+            </aside>
+
+            <!-- Active Chat Conversation View -->
+            <section class="ai-chat-view">
+              <div class="ai-quick-prompts">
+                <span class="quick-prompt-label"><i class="fa-solid fa-bolt"></i> Suggested Questions:</span>
+                <button class="prompt-chip" data-q="What does this circuit do? Give a concise overview of its components and behavior.">
+                  <i class="fa-solid fa-bolt"></i> Circuit Overview
+                </button>
+                <button class="prompt-chip" data-q="Explain this circuit in detail with a step-by-step breakdown of each branch, voltages, and DC steady-state behavior.">
+                  <i class="fa-solid fa-list-check"></i> Explain in Detail
+                </button>
+                <button class="prompt-chip" data-q="How do the capacitors and inductors behave in this circuit in DC steady state?">
+                  <i class="fa-solid fa-wave-square"></i> DC Steady State
+                </button>
+                <button class="prompt-chip" data-q="Are there any warnings, floating pins, or connection errors in this schematic?">
+                  <i class="fa-solid fa-triangle-exclamation"></i> Check Warnings
+                </button>
+                <button class="prompt-chip" data-q="Summarize the SPICE netlist connections in simple terms.">
+                  <i class="fa-solid fa-diagram-project"></i> SPICE Netlist
+                </button>
+              </div>
+
+              <div class="ai-chat-thread" id="aiChatThread">
+                <div class="ai-message assistant">
+                  <div class="msg-avatar"><i class="fa-solid fa-robot"></i></div>
+                  <div class="msg-body">
+                    <strong>Paper2CAD Assistant</strong>
+                    <p>Hello! I inspect your hand-drawn circuit using verified graph topology and components. Ask me anything about components, connected nodes, or electrical behavior.</p>
+                  </div>
+                </div>
+              </div>
+
+              <div class="ai-input-bar">
+                <input type="text" id="aiQuestionInput" placeholder="Ask about this circuit (e.g. 'What is the voltage across the 100 ohm resistor?' or 'Explain in detail')...">
+                <button class="btn-send-ai" id="aiSendBtn">
+                  <i class="fa-solid fa-paper-plane"></i> Ask
+                </button>
+              </div>
+            </section>
           </div>
         </div>
       </div>
@@ -685,6 +741,6 @@
   <!-- Toast Notification -->
   <div class="toast" id="toast">Copied to clipboard!</div>
 
-  <script src="app.js?v=2.2.2"></script>
+  <script src="app.js?v=2.5.0"></script>
 </body>
 </html>

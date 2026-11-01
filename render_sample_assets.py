@@ -67,6 +67,16 @@ for name in ['cir1', 'cir2', 'cir3', 'cir4', 'cir5']:
         print(f"Generated {annotated_file}")
         
         render_circuit_graph(graph, job_dir)
+        
+        # Also mirror to test_previews and mcp_renders
+        test_prev_dir = REPO_ROOT / 'outputs' / 'test_previews'
+        test_prev_dir.mkdir(parents=True, exist_ok=True)
+        render_circuit_graph(graph, test_prev_dir)
+        
+        mcp_dir = REPO_ROOT / 'outputs' / 'mcp_renders' / name
+        mcp_dir.mkdir(parents=True, exist_ok=True)
+        render_circuit_graph(graph, mcp_dir)
+        
         print(f"Rendered CAD SVGs for {name}")
 
 print("All samples successfully pre-generated!")
