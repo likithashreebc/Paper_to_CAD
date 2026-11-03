@@ -273,6 +273,11 @@ class CircuitGraph(BaseModel):
         raw_edges = data.get("edges", [])
         raw_texts = data.get("texts", [])
         raw_nets = data.get("nets", [])
+        endpoint_to_node_id = {
+            eid: int(net.get("id", net_idx))
+            for net_idx, net in enumerate(raw_nets)
+            for eid in net.get("endpoint_eids", [])
+        }
 
         # Build point coordinate lookup
         point_by_id: Dict[int, dict] = {}
@@ -440,13 +445,17 @@ class CircuitGraph(BaseModel):
         for edge_idx, re_edge in enumerate(raw_edges):
             eid1 = re_edge.get("eid1")
             eid2 = re_edge.get("eid2")
-            pt1 = point_by_id.get(eid1, {})
-            pt2 = point_by_id.get(eid2, {})
-            x1 = float(pt1.get("x", 0))
-            y1 = float(pt1.get("y", 0))
-            x2 = float(pt2.get("x", 0))
-            y2 = float(pt2.get("y", 0))
+            endpoint1 = endpoint_by_eid.get(eid1, {})
+            endpoint2 = endpoint_by_eid.get(eid2, {})
+            pt1 = point_by_id.get(endpoint1.get("point_id", eid1), {})
+            pt2 = point_by_id.get(endpoint2.get("point_id", eid2), {})
+            x1 = float(endpoint1.get("x", endpoint1.get("x_raw", pt1.get("x", 0))))
+            y1 = float(endpoint1.get("y", endpoint1.get("y_raw", pt1.get("y", 0))))
+            x2 = float(endpoint2.get("x", endpoint2.get("x_raw", pt2.get("x", 0))))
+            y2 = float(endpoint2.get("y", endpoint2.get("y_raw", pt2.get("y", 0))))
             dist = float(re_edge.get("dist", math.hypot(x2 - x1, y2 - y1)))
+            node_id1 = endpoint_to_node_id.get(eid1)
+            node_id2 = endpoint_to_node_id.get(eid2)
 
             wires.append(WireSegmentModel(
                 id=edge_idx,
@@ -454,6 +463,7 @@ class CircuitGraph(BaseModel):
                 start_y=y1,
                 end_x=x2,
                 end_y=y2,
+                node_id=node_id1 if node_id1 == node_id2 else None,
                 length=dist,
                 confidence=float(re_edge.get("ratio", 1.0)),
                 ambiguous_crossing=(re_edge.get("dir") == "crossover")

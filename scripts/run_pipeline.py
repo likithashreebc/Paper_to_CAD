@@ -65,6 +65,11 @@ def main():
     parser.add_argument("--stage", choices=["all", "yolo", "parseq", "suppress", "hawp", "merge", "wires", "connect", "final", "spice"],
                         default="all", help="Pipeline stage to run")
     parser.add_argument("--device", default=None, help="Device to use ('cpu' or 'cuda')")
+    parser.add_argument("--conf", type=float, default=0.45, help="YOLO detection confidence threshold")
+    parser.add_argument("--skip-type-refinement", action="store_true",
+                        help="Skip optional DINOv2 component subtype refinement")
+    parser.add_argument("--skip-port-estimation", action="store_true",
+                        help="Skip optional ViTPose component port estimation")
     args = parser.parse_args()
 
     cfg_file = args.config if args.config else str(get_default_config_path())
@@ -118,7 +123,7 @@ def main():
         yolo = YOLO(str(yolo_model))
         kwargs = {
             "source": str(src_img),
-            "conf": 0.45,
+            "conf": args.conf,
             "iou": 0.40,
             "save_txt": True,
             "save_conf": True,
@@ -165,8 +170,14 @@ def main():
     # 7. Connectivity & Ports
     if stage in ("all", "connect"):
         run_cmd([py, str(PIPELINE_DIR / "build_connections.py")], "[7.1/9] Connectivity Inference", env=env)
-        run_cmd([py, str(PIPELINE_DIR / "refine_component_types.py")], "[7.2/9] DINOv2 Subtype Refinement", env=env)
-        run_cmd([py, str(PIPELINE_DIR / "infer_port_vitpose.py")], "[7.3/9] ViTPose Port Landmark Estimation", env=env)
+        if args.skip_type_refinement:
+            print("[WARN] Skipping optional DINOv2 subtype refinement.")
+        else:
+            run_cmd([py, str(PIPELINE_DIR / "refine_component_types.py")], "[7.2/9] DINOv2 Subtype Refinement", env=env)
+        if args.skip_port_estimation:
+            print("[WARN] Skipping optional ViTPose port landmark estimation.")
+        else:
+            run_cmd([py, str(PIPELINE_DIR / "infer_port_vitpose.py")], "[7.3/9] ViTPose Port Landmark Estimation", env=env)
 
     # 8. Final JSON & Visuals
     if stage in ("all", "final"):

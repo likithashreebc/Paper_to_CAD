@@ -497,7 +497,14 @@ document.addEventListener("DOMContentLoaded", () => {
     currentEditingCompId = comp.id;
     if (editCompId) editCompId.textContent = `#${comp.id} (${comp.display_type || comp.type})`;
     if (editValueInput) editValueInput.value = comp.value || "";
-    if (editTypeSelect) editTypeSelect.value = comp.type || "resistor";
+    const selectedType = comp.type_refined || comp.type;
+    if (editTypeSelect && ![...editTypeSelect.options].some(option => option.value === selectedType)) {
+      const option = document.createElement("option");
+      option.value = selectedType;
+      option.textContent = selectedType;
+      editTypeSelect.appendChild(option);
+    }
+    if (editTypeSelect) editTypeSelect.value = selectedType || "resistor";
     const termSelect = document.getElementById("editTerminalSelect");
     if (termSelect) {
       termSelect.innerHTML = '<option value="">Select Pin...</option>';
@@ -805,7 +812,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // 2. Metrics strip
     statComponents.textContent = data.stats.total_components;
     statLabels.textContent = data.stats.total_labels;
-    statNets.textContent = (data.spice_netlist.match(/^[RCLVDIMQX]/gm) || []).length;
+    statNets.textContent = data.stats.total_nets ?? (data.spice_netlist.match(/^[RCLVDIMQX]/gm) || []).length;
     statTime.textContent = data.stats.processing_time;
     metricsStrip.style.display = "grid";
 
@@ -1105,7 +1112,14 @@ document.addEventListener("DOMContentLoaded", () => {
         currentEditingCompId = comp.id;
         editCompId.textContent = `#${comp.id} (${comp.display_type})`;
         editValueInput.value = comp.value || "";
-        editTypeSelect.value = comp.type;
+        const selectedType = comp.type_refined || comp.type;
+        if (![...editTypeSelect.options].some(option => option.value === selectedType)) {
+          const option = document.createElement("option");
+          option.value = selectedType;
+          option.textContent = selectedType;
+          editTypeSelect.appendChild(option);
+        }
+        editTypeSelect.value = selectedType;
 
         const termSelect = document.getElementById("editTerminalSelect");
         if (termSelect) {
@@ -1199,32 +1213,46 @@ document.addEventListener("DOMContentLoaded", () => {
         saveCompEditBtn.disabled = true;
         saveCompEditBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
 
-        // 1. Update value
-        if (newVal) {
-          await fetch(`/api/jobs/${currentJobId}/correct`, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({action: "update_value", params: {comp_id: currentEditingCompId, value: newVal}})
-          });
-        }
-
-        // 2. Update type
-        if (newType) {
+        let updateData;
+        const corrections = [
+          {action: "update_value", params: {comp_id: currentEditingCompId, value: newVal}},
+          {action: "update_type", params: {comp_id: currentEditingCompId, type: newType}}
+        ];
+        for (const correction of corrections) {
           const res = await fetch(`/api/jobs/${currentJobId}/correct`, {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({action: "update_type", params: {comp_id: currentEditingCompId, type: newType}})
+            body: JSON.stringify(correction)
           });
-          const updateData = await res.json();
+          updateData = await res.json();
+          if (!res.ok || !updateData.success) {
+            throw new Error(updateData.message || `Save failed (${res.status})`);
+          }
+        }
+
+        if (updateData) {
           renderInspectorComponents(updateData.components || []);
           renderInspectorNodes(updateData.nodes || []);
           renderValidationFindings(updateData.findings || []);
+          if (currentResults) {
+            const updatedComponents = new Map((updateData.components || []).map(comp => [comp.id, comp]));
+            currentResults.components = (currentResults.components || []).map(comp => {
+              const updated = updatedComponents.get(comp.id);
+              return updated
+                ? {...comp, value: updated.value || "", designator: updated.label || comp.designator || ""}
+                : comp;
+            });
+            currentResults.spice_netlist = updateData.spice_netlist;
+            renderComponentInventory(currentResults.components);
+          }
+          if (spiceCodeBlock) spiceCodeBlock.textContent = updateData.spice_netlist || "";
+          if (jsonCodeBlock) jsonCodeBlock.textContent = JSON.stringify(updateData.graph, null, 2);
         }
 
-        // 3. Refresh display image
         mainDisplayImg.src = `/api/jobs/${currentJobId}/schematic/${activeCadTheme}?t=${Date.now()}`;
+        if (sketchDisplayImg) sketchDisplayImg.src = `/api/jobs/${currentJobId}/annotated?t=${Date.now()}`;
         graphEditCard.style.display = "none";
-        showToast(`Component #${currentEditingCompId} updated and circuit re-rendered!`);
+        showToast(`Component #${currentEditingCompId} updated; schematic and SPICE refreshed.`);
       } catch (err) {
         showToast(`Edit failed: ${err.message}`);
       } finally {
@@ -1306,8 +1334,12 @@ document.addEventListener("DOMContentLoaded", () => {
   function loadPastChatsFromStorage() {
     try {
       const raw = localStorage.getItem("paper2cad_past_chats");
-      pastChatSessions = raw ? JSON.parse(raw) : [];
+      const scrubbedRaw = raw ? raw.replace(/\b(?:sk-[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9_-]{20,})\b/gi, "[redacted credential]") : null;
+      pastChatSessions = scrubbedRaw ? JSON.parse(scrubbedRaw) : [];
       if (!Array.isArray(pastChatSessions)) pastChatSessions = [];
+      if (scrubbedRaw && scrubbedRaw !== raw) {
+        localStorage.setItem("paper2cad_past_chats", scrubbedRaw);
+      }
     } catch (e) {
       console.warn("Could not load past chats from storage:", e);
       pastChatSessions = [];
@@ -1579,12 +1611,16 @@ document.addEventListener("DOMContentLoaded", () => {
       const data = await res.json();
       const statusEl = document.getElementById("aiStatusIndicator");
       if (statusEl) {
-        if (data.has_groq) {
-          const modelName = data.model || "Groq LLM";
-          statusEl.innerHTML = `<span class="badge-groq-active" title="${data.hint}"><i class="fa-solid fa-bolt"></i> Groq Active (${modelName})</span>`;
+        const badge = document.createElement("span");
+        if (data.has_llm || data.has_groq) {
+          badge.className = "badge-groq-active";
+          badge.textContent = `⚡ ${data.provider || "LLM"} Configured`;
         } else {
-          statusEl.innerHTML = `<span class="badge-groq-pending" title="${data.hint}"><i class="fa-solid fa-circle-info"></i> Local Engine (Add GROQ_API_KEY in .env)</span>`;
+          badge.className = "badge-groq-pending";
+          badge.textContent = "ⓘ Offline Grounded Mode";
         }
+        badge.title = data.hint || "";
+        statusEl.replaceChildren(badge);
       }
     } catch (e) {
       console.warn("Could not check assistant status:", e);
@@ -1605,7 +1641,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // Show temporary typing bubble
     const typingId = "typing-" + Date.now();
-    appendChatMessage("assistant", '<i class="fa-solid fa-spinner fa-spin"></i> Groq AI is analyzing circuit diagram...', typingId);
+    appendChatMessage("assistant", '<i class="fa-solid fa-spinner fa-spin"></i> Paper2CAD Assistant is analyzing the circuit...', typingId);
 
     try {
       const res = await fetch(`/api/jobs/${targetJobId}/assistant/chat`, {
@@ -1620,8 +1656,16 @@ document.addEventListener("DOMContentLoaded", () => {
       const typingEl = document.getElementById(typingId);
       if (typingEl) typingEl.remove();
 
+      if (!res.ok || data.success === false) {
+        const detail = data.detail || data.error || "The assistant request failed.";
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+
       const answer = data.answer || "No response received.";
-      const providerBadge = data.provider ? `<span class="ai-provider-pill"><i class="fa-solid fa-bolt"></i> ${data.provider}${data.model ? ' • ' + data.model : ''}</span>` : '';
+      const knownProviders = ["Groq", "OpenAI", "OpenAI-compatible LLM", "Deterministic Grounded Engine"];
+      const providerBadge = knownProviders.includes(data.provider)
+        ? `<span class="ai-provider-pill"><i class="fa-solid fa-bolt"></i> ${data.provider}</span>`
+        : "";
       appendChatMessage("assistant", answer, null, providerBadge);
 
       // Record in conversation history for multi-turn reasoning
@@ -1907,4 +1951,3 @@ document.addEventListener("DOMContentLoaded", () => {
     console.error("Initial preset load error:", err);
   }
 });
-

@@ -34,6 +34,66 @@ except ImportError:
     requests = None
 
 
+_QUANTITY_RE = re.compile(
+    r"(?P<number>[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*"
+    r"(?P<suffix>meg|[TGMkmunpfµμ]?)(?P<unit>ohms?|Ω|volts?|V|amps?|A|farads?|F|henries|H|seconds?|s|watts?|W)?",
+    re.IGNORECASE,
+)
+_API_KEY_VALUE_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9_-]{20,})", re.IGNORECASE)
+_ENGINEERING_PREFIXES = {
+    "": 1.0,
+    "T": 1e12,
+    "G": 1e9,
+    "M": 1e6,
+    "k": 1e3,
+    "K": 1e3,
+    "m": 1e-3,
+    "u": 1e-6,
+    "μ": 1e-6,
+    "µ": 1e-6,
+    "n": 1e-9,
+    "p": 1e-12,
+    "f": 1e-15,
+    "meg": 1e6,
+}
+
+
+def _quantity_value(text: str) -> Optional[float]:
+    match = _QUANTITY_RE.fullmatch(text.strip())
+    if not match:
+        return None
+    prefix = match.group("suffix")
+    if prefix.lower() == "meg":
+        multiplier = 1e6
+    else:
+        multiplier = _ENGINEERING_PREFIXES.get(prefix, _ENGINEERING_PREFIXES.get(prefix.lower()))
+    if multiplier is None:
+        return None
+    return float(match.group("number")) * multiplier
+
+
+def _question_quantity(question: str, aliases: str) -> Optional[float]:
+    match = re.search(
+        rf"(?:{aliases})\s*(?:across\b[^,;]+?\s*)?(?:=|:|is|of)?\s*"
+        r"([+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?\s*(?:meg|[TGMkmunpfµμ]?)"
+        r"(?:ohms?|Ω|volts?|V|amps?|A|farads?|F|henries|H|seconds?|s|watts?|W)?)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    return _quantity_value(match.group(1)) if match else None
+
+
+def _format_calculated_value(value: float, unit: str) -> str:
+    if value == 0:
+        return f"0 {unit}"
+    prefixes = ((1e9, "G"), (1e6, "M"), (1e3, "k"), (1, ""), (1e-3, "m"), (1e-6, "u"), (1e-9, "n"), (1e-12, "p"))
+    for scale, prefix in prefixes:
+        scaled = abs(value) / scale
+        if 1 <= scaled < 1000:
+            return f"{scaled:.4g} {prefix}{unit}".strip()
+    return f"{value:.4g} {unit}"
+
+
 SYSTEM_PROMPT = """You are Paper2CAD Assistant, a knowledgeable, friendly, and articulate Electrical Engineering AI assistant that communicates in a natural, clear ChatGPT style.
 You analyze hand-drawn circuit diagrams converted into digital schematics and SPICE netlists by Paper2CAD Studio.
 
@@ -141,30 +201,49 @@ class AICircuitAssistant:
         except Exception:
             pass
 
-        # Check for Groq API key first, then fallback to LLM_API_KEY / OPENAI_API_KEY
-        groq_key = (
-            api_key
-            or os.environ.get("GROQ_API_KEY")
-            or os.environ.get("LLM_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-        )
+        configured_url = base_url or os.environ.get("LLM_BASE_URL")
+        groq_url = os.environ.get("GROQ_BASE_URL")
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+        openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        generic_key = os.environ.get("LLM_API_KEY", "").strip()
 
-        if groq_key and groq_key.strip():
-            self.api_key = groq_key.strip()
-            # If key starts with gsk_ or GROQ_API_KEY is defined, use Groq defaults
-            if self.api_key.startswith("gsk_") or os.environ.get("GROQ_API_KEY"):
-                self.base_url = base_url or os.environ.get("GROQ_BASE_URL") or os.environ.get("LLM_BASE_URL") or "https://api.groq.com/openai/v1"
-                self.model = model or os.environ.get("GROQ_MODEL") or os.environ.get("LLM_MODEL") or "qwen/qwen3.8-27b"
-                self.provider = "Groq"
-            else:
-                self.base_url = base_url or os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
-                self.model = model or os.environ.get("LLM_MODEL", "gpt-4o-mini")
-                self.provider = "OpenAI"
+        if configured_url:
+            self.base_url = configured_url
+        elif groq_url and groq_key:
+            self.base_url = groq_url
+        elif groq_key and not (api_key or openai_key or generic_key):
+            self.base_url = "https://api.groq.com/openai/v1"
+        elif api_key or openai_key or generic_key:
+            self.base_url = "https://api.openai.com/v1"
         else:
-            self.api_key = None
             self.base_url = None
-            self.model = None
+
+        normalized_url = (self.base_url or "").lower()
+        if "api.groq.com" in normalized_url or (groq_url and self.base_url == groq_url):
+            self.provider = "Groq"
+            selected_key = api_key or groq_key or generic_key
+            self.model = model or os.environ.get("GROQ_MODEL") or os.environ.get("LLM_MODEL") or "qwen/qwen3.8-27b"
+        elif "api.openai.com" in normalized_url:
+            self.provider = "OpenAI"
+            selected_key = api_key or openai_key or generic_key
+            self.model = model or os.environ.get("OPENAI_MODEL") or os.environ.get("LLM_MODEL") or "gpt-4o-mini"
+        elif self.base_url:
+            self.provider = "OpenAI-compatible LLM"
+            selected_key = api_key or generic_key
+            self.model = model or os.environ.get("LLM_MODEL")
+        else:
             self.provider = "Deterministic Grounded Engine"
+            selected_key = None
+            self.model = None
+
+        self.api_key = selected_key or None
+
+        if self.model and _API_KEY_VALUE_RE.fullmatch(self.model.strip()):
+            self.model = (
+                "gpt-4o-mini"
+                if self.provider == "OpenAI"
+                else "qwen/qwen3.8-27b" if self.provider == "Groq" else None
+            )
 
     def explain_circuit(
         self,
@@ -180,8 +259,17 @@ class AICircuitAssistant:
         Generates an insightful explanation or answers user questions.
         Uses Groq LLM if configured in .env; otherwise falls back to deterministic grounded analyzer.
         """
+        calculation = self._calculate_component_value(graph, user_question or "")
+        if calculation:
+            return calculation
+
         # If external Groq / LLM key is configured, query LLM
-        if self.api_key and self.api_key != "none":
+        local_endpoint_without_key = (
+            self.provider == "OpenAI-compatible LLM"
+            and self.base_url is not None
+            and not any(host in self.base_url.lower() for host in ("api.openai.com", "api.groq.com"))
+        )
+        if self.base_url and self.model and (self.api_key or local_endpoint_without_key) and self.api_key != "none":
             try:
                 return self._call_llm(
                     graph,
@@ -194,16 +282,9 @@ class AICircuitAssistant:
                 )
             except Exception as e:
                 fallback = self._generate_grounded_response(graph, findings or [], sim_result, user_question)
-                return f"{fallback}\n\n> ⚠️ **LLM Notice**: Groq API request failed (`{e}`). Displaying verified deterministic topological analysis above. Check your `GROQ_API_KEY` in `.env`."
+                return f"{fallback}\n\n> ⚠️ **LLM Notice**: {self.provider} request failed (`{e}`). Displaying the grounded offline analysis above. Check your provider API key and endpoint configuration."
 
-        # Deterministic Grounded Analysis Mode (Always available offline with zero external dependencies)
-        grounded = self._generate_grounded_response(graph, findings or [], sim_result, user_question)
-        hint = (
-            "\n\n---\n"
-            "💡 **Want interactive conversational AI?** Add your free Groq API key to `.env` (`GROQ_API_KEY=gsk_...`). "
-            "Get one instantly at [console.groq.com](https://console.groq.com/keys) to unlock full reasoning with `qwen/qwen3.8-27b`!"
-        )
-        return f"{grounded}{hint}"
+        return self._generate_grounded_response(graph, findings or [], sim_result, user_question)
 
     def _call_llm(
         self,
@@ -235,7 +316,11 @@ class AICircuitAssistant:
         grounding_prefix = (
             f"Verified Circuit Topology ({graph.image_name}):\n"
             + "\n".join(comp_lines)
-            + "\nGround Reference: Ground (0V)\n"
+            + (
+                "\nGround Reference: Ground (0V) is present.\n"
+                if any(node.is_ground or node.name == "0" for node in graph.nodes)
+                else "\nGround Reference: No ground reference was detected.\n"
+            )
             + (f"\nSPICE Netlist:\n```spice\n{spice_netlist.strip()}\n```\n" if spice_netlist else "")
         )
 
@@ -289,19 +374,18 @@ class AICircuitAssistant:
         # Token budget: 450 tokens for concise (safely fits Groq TPM and never cuts off), 780 for detailed
         token_limit = 780 if is_detail_requested else 450
 
-        # Candidate models with automatic fallback
-        candidate_models = []
-        if self.model:
-            candidate_models.append(self.model)
-        for m in ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]:
-            if m not in candidate_models:
-                candidate_models.append(m)
+        candidate_models = [self.model] if self.model else []
+        if self.provider == "Groq" and self.api_key:
+            for fallback_model in ("qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"):
+                if fallback_model not in candidate_models:
+                    candidate_models.append(fallback_model)
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
             "User-Agent": "Paper2CAD-AI/1.0 (Windows; Electrical Studio)"
         }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         last_error = None
         for model_to_try in candidate_models:
@@ -364,7 +448,10 @@ class AICircuitAssistant:
                     continue
                 raise RuntimeError(f"Connection error to {self.provider} ({self.base_url}): {e}")
 
-        raise RuntimeError(f"All Groq models failed. Last error: {last_error}")
+        raise RuntimeError(
+            f"{self.provider} request failed for configured model '{self.model}'. "
+            f"Verify LLM_MODEL is available for this provider. Last error: {last_error}"
+        )
 
     def _generate_grounded_response(
         self,
@@ -377,6 +464,10 @@ class AICircuitAssistant:
         Generates a rigorous, deterministic grounded analysis of the circuit graph.
         Never hallucinates; derives strictly from topological nodes and components.
         """
+        calculation = self._calculate_component_value(graph, question or "")
+        if calculation:
+            return calculation
+
         # If question is about a specific component (e.g. "What is connected to component 2?" or "resistor")
         if question:
             q_lower = question.lower()
@@ -406,8 +497,10 @@ class AICircuitAssistant:
                     )
                     return sanitize_chat_text(out)
 
-            # Check for validation question
-            if "flag" in q_lower or "warning" in q_lower or "error" in q_lower or "rule" in q_lower:
+            if any(word in q_lower for word in (
+                "warning", "error", "rule", "issue", "problem", "wrong",
+                "short", "ground", "validat", "connection",
+            )):
                 if not findings:
                     return "No validation errors or warnings are currently flagged on this circuit graph."
                 res = ["### Active Validation Findings:\n"]
@@ -418,46 +511,74 @@ class AICircuitAssistant:
                     res.append(f"- **Suggested Action:** {f.suggested_action}\n")
                 return sanitize_chat_text("\n".join(res))
 
-        # Standard comprehensive circuit explanation
-        total_comps = len(graph.components)
-        active_comps = [c for c in graph.components if c.type not in ("text", "junction")]
-        sources = [c for c in active_comps if any(k in c.type for k in ("voltage", "current", "battery"))]
-        passives = [c for c in active_comps if c.type in ("resistor", "capacitor", "inductor")]
-        semiconductors = [c for c in active_comps if any(k in c.type for k in ("diode", "transistor", "amplifier", "opamp", "led"))]
+            if any(word in q_lower for word in ("component", "inventory", "list", "detected")):
+                return self._format_component_inventory(graph)
+
+            if not any(word in q_lower for word in (
+                "overview", "circuit do", "circuit work", "circuit function",
+                "topology", "connected", "node", "net", "current flow", "behavior",
+                "behaviour",
+            )):
+                return (
+                    "I’m in offline grounded mode, so I can answer from detected circuit data but can’t handle open-ended questions. "
+                    "Try asking about a component, its connections, the detected inventory, validation warnings, or a value calculation. "
+                    "For general conversational circuit analysis, configure an LLM provider in the local `.env` file."
+                )
+
+        # An overview can describe the detected graph, but cannot infer intended function
+        # when component values or connectivity are missing or flagged as uncertain.
+        active_comps = [c for c in graph.components if c.type.lower() not in ("text", "junction")]
+        families = {
+            "sources": [c for c in active_comps if any(k in c.display_type.lower() for k in ("voltage", "current", "battery"))],
+            "passives": [c for c in active_comps if any(k in c.display_type.lower() for k in ("resistor", "capacitor", "inductor"))],
+            "semiconductors": [c for c in active_comps if any(k in c.display_type.lower() for k in ("diode", "transistor", "amplifier", "opamp", "led"))],
+        }
 
         res = [f"## Circuit Overview: `{graph.image_name}`\n"]
         res.append(f"The hand-drawn diagram contains **{len(active_comps)} components** interconnected across **{len(graph.nodes)} electrical nodes**.\n")
 
-        # Composition breakdown
         res.append("### Component Inventory:")
-        if sources:
-            res.append(f"- **Power Sources:** " + ", ".join(f"{s.display_type} {s.id} ({s.value or 'nominal'})" for s in sources))
-        if passives:
-            res.append(f"- **Passives (R/L/C):** " + ", ".join(f"{p.display_type} {p.id} ({p.value or 'unlabeled'})" for p in passives))
-        if semiconductors:
-            res.append(f"- **Active / Semiconductor:** " + ", ".join(f"{sc.display_type} {sc.id}" for sc in semiconductors))
-        if not sources and not passives and not semiconductors:
+        for title, key in (
+            ("Power Sources", "sources"),
+            ("Passives (R/L/C)", "passives"),
+            ("Active / Semiconductor", "semiconductors"),
+        ):
+            components = families[key]
+            if components:
+                details = ", ".join(
+                    f"{c.display_type} {c.label or c.id} ({c.value or 'value unknown'})"
+                    for c in components
+                )
+                res.append(f"- **{title}:** {details}")
+        if not any(families.values()):
             res.append("- (No recognized electronic primitives)")
 
-        # Topological Connectivity Summary
         res.append("\n### Electrical Network Topology:")
         has_ground = any(n.is_ground for n in graph.nodes)
         res.append(f"- **Reference Ground:** {'Detected (Node 0)' if has_ground else '⚠️ Not detected (floating)'}")
         res.append(f"- **Total Nodes:** {len(graph.nodes)} distinct equivalence nets.")
 
-        # Validation Summary
-        res.append("\n### Inspection & Rule Validation:")
-        if not findings:
-            res.append("✅ **All electrical validation checks passed.** No floating terminals, shorts, or dangling branches detected.")
-        else:
+        if findings:
+            res.append("\n### Validation Issues:")
             errors = [f for f in findings if f.severity == "error"]
             warnings = [f for f in findings if f.severity == "warning"]
             infos = [f for f in findings if f.severity == "info"]
             res.append(f"- **Errors:** {len(errors)}, **Warnings:** {len(warnings)}, **Notes:** {len(infos)}")
-            for f in findings[:3]:  # Top 3 findings
-                res.append(f"  - `[{f.severity.upper()}]` **{f.title}:** {f.suggested_action}")
+            for f in findings:
+                res.append(f"- **{f.severity.upper()}: {f.title}.** {f.suggested_action}")
+            res.append(
+                "\nThese findings make the inferred circuit behavior uncertain. "
+                "Resolve the flagged connections and ground reference before relying on a functional explanation."
+            )
+        elif active_comps:
+            res.append("\nNo validation findings were supplied for this circuit.")
 
-        # SPICE Simulation Summary
+        if question:
+            res.append(
+                "\nThis is a topology-based summary, not a full conversational analysis. "
+                "Component values or intended function that are not present in the detected data cannot be inferred."
+            )
+
         if sim_result and sim_result.get("success"):
             res.append("\n### SPICE Simulation (DC Operating Point):")
             voltages = sim_result.get("node_voltages", {})
@@ -465,3 +586,121 @@ class AICircuitAssistant:
                 res.append("- **Node Voltages:** " + ", ".join(f"`V({k}) = {v:.2f}V`" for k, v in list(voltages.items())[:6]))
 
         return sanitize_chat_text("\n".join(res))
+
+    @staticmethod
+    def _format_component_inventory(graph: CircuitGraph) -> str:
+        components = [c for c in graph.components if c.type.lower() not in ("text", "junction")]
+        if not components:
+            return "No electronic components were detected in this circuit."
+        lines = ["Detected components:"]
+        for component in components:
+            name = component.label or f"Component {component.id}"
+            value = component.value or "value not detected"
+            lines.append(f"- {name}: {component.display_type}, {value}.")
+        return "\n".join(lines)
+
+    def _calculate_component_value(self, graph: CircuitGraph, question: str) -> Optional[str]:
+        """Calculate a passive value only when the user supplies enough numeric inputs."""
+        if not re.search(r"\b(?:calculate|compute|find|determine)\b", question, re.IGNORECASE):
+            return None
+        if not re.search(r"\b(?:value|resistance|capacitance|inductance|[RCL]\s*\d+)\b", question, re.IGNORECASE):
+            return None
+
+        component = None
+        id_match = re.search(r"\b(?:component|comp)\s*#?\s*(\d+)\b", question, re.IGNORECASE)
+        designator_match = re.search(r"\b([RCL])\s*(\d+)\b", question, re.IGNORECASE)
+        if id_match:
+            component = graph.get_component(int(id_match.group(1)))
+        elif designator_match:
+            prefix, index = designator_match.group(1).upper(), int(designator_match.group(2))
+            matching = [
+                item for item in graph.components
+                if (("resistor" in item.display_type.lower() and prefix == "R")
+                    or ("capacitor" in item.display_type.lower() and prefix == "C")
+                    or ("inductor" in item.display_type.lower() and prefix == "L"))
+            ]
+            component = next(
+                (item for item in matching if (item.label or "").strip().upper() == f"{prefix}{index}"),
+                matching[index - 1] if 0 < index <= len(matching) else None,
+            )
+        else:
+            kind = next(
+                (kind for kind in ("resistor", "capacitor", "inductor") if kind in question.lower()),
+                None,
+            )
+            matching = [item for item in graph.components if kind and kind in item.display_type.lower()]
+            if len(matching) == 1:
+                component = matching[0]
+
+        if component is None:
+            return None
+
+        component_type = component.display_type.lower()
+        voltage = _question_quantity(question, r"\b(?:voltage|volts?|V)\b")
+        current = _question_quantity(question, r"\b(?:current|amps?|A|I)\b")
+        power = _question_quantity(question, r"\b(?:power|watts?|W|P)\b")
+        resistance = _question_quantity(question, r"\b(?:resistance|ohms?|Ω|R)\b")
+        time_constant = _question_quantity(question, r"\b(?:time\s*constant|tau|τ)\b")
+
+        result = None
+        formula = ""
+        substitution = ""
+        unit = ""
+        if "resistor" in component_type:
+            if voltage is not None and current not in (None, 0):
+                result, formula = voltage / current, "R = V / I"
+                substitution = f"{voltage:g} V / {current:g} A"
+            elif voltage is not None and power not in (None, 0):
+                result, formula = voltage * voltage / power, "R = V^2 / P"
+                substitution = f"({voltage:g} V)^2 / {power:g} W"
+            elif current is not None and power is not None and current != 0:
+                result, formula = power / (current * current), "R = P / I^2"
+                substitution = f"{power:g} W / ({current:g} A)^2"
+            unit = "ohm"
+        elif "capacitor" in component_type and time_constant is not None and resistance not in (None, 0):
+            result, formula, unit = time_constant / resistance, "C = tau / R", "F"
+            substitution = f"{time_constant:g} s / {resistance:g} ohm"
+        elif "inductor" in component_type and time_constant is not None and resistance is not None:
+            result, formula, unit = time_constant * resistance, "L = tau * R", "H"
+            substitution = f"{time_constant:g} s * {resistance:g} ohm"
+
+        prefix = next(
+            (letter for kind, letter in (
+                ("resistor", "R"),
+                ("capacitor", "C"),
+                ("inductor", "L"),
+            ) if kind in component_type),
+            None,
+        )
+        matching_components = [
+            item for item in graph.components
+            if prefix and prefix == next(
+                (letter for kind, letter in (
+                    ("resistor", "R"),
+                    ("capacitor", "C"),
+                    ("inductor", "L"),
+                ) if kind in item.display_type.lower()),
+                None,
+            )
+        ]
+        designator = f"{prefix}{matching_components.index(component) + 1}" if component in matching_components else None
+        target = component.label or designator or f"{component.display_type} component {component.id}"
+        if result is None:
+            if "resistor" in component_type:
+                needed = "voltage and current (R = V / I), or voltage and power (R = V^2 / P)"
+            elif "capacitor" in component_type:
+                needed = "the time constant and resistance (C = tau / R)"
+            elif "inductor" in component_type:
+                needed = "the time constant and resistance (L = tau * R)"
+            else:
+                return None
+            return (
+                f"I can calculate {target}, but the question does not provide enough numeric inputs. "
+                f"Please provide {needed}. I will not guess a value from the drawing."
+            )
+
+        return (
+            f"Calculated {target} = {_format_calculated_value(result, unit)} "
+            f"using {formula} = {substitution}. This is a calculation only; "
+            "it has not changed the component value in the circuit. Use Edit to apply it if correct."
+        )

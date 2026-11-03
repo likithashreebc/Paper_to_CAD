@@ -21,7 +21,10 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "src" / "pipeline"))
 
 from src.mcp_server import (
+    _build_job_config,
+    _missing_optional_pipeline_weights,
     inspect_circuit,
+    process_sketch,
     validate_circuit,
     generate_schematic,
     export_spice_netlist,
@@ -40,6 +43,46 @@ class TestMCPServer(unittest.TestCase):
         self.assertIn("components", res)
         self.assertIn("nodes", res)
         self.assertGreater(len(res["components"]), 0)
+
+    def test_circuit_id_rejects_path_segments(self):
+        res = json.loads(inspect_circuit("../cir1"))
+        self.assertIn("error", res)
+
+    def test_process_sketch_rejects_missing_image(self):
+        res = json.loads(process_sketch("missing-sketch.png"))
+        self.assertIn("error", res)
+
+    def test_job_config_isolates_pipeline_outputs(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "input"
+            job_dir = root / "job"
+            config = _build_job_config(
+                {"paths": {"src_img": "shared-input", "final_result_root": "shared-output"}},
+                input_dir,
+                job_dir,
+            )
+
+        self.assertEqual(config["paths"]["src_img"], str(input_dir))
+        self.assertEqual(config["paths"]["final_result_root"], str(job_dir / "final"))
+        self.assertEqual(config["paths"]["spice_netlists"], str(job_dir / "spice"))
+
+    def test_missing_optional_weights_identifies_skipped_stages(self):
+        missing = _missing_optional_pipeline_weights({
+            "weights": {
+                "bjt_ckpt": "missing_bjt.pt",
+                "fet_ckpt": "missing_fet.pt",
+                "dcsrc_ckpt": "missing_dcsrc.pt",
+                "pose3k_wts": "missing_pose3k.pth",
+                "pose2k_wts": "missing_pose2k.pth",
+            }
+        })
+        self.assertIn("DINOv2 subtype refinement", missing)
+        self.assertIn("ViTPose port estimation", missing)
+        self.assertEqual(len(missing["DINOv2 subtype refinement"]), 3)
+        self.assertEqual(len(missing["ViTPose port estimation"]), 2)
 
     def test_validate_circuit_tool(self):
         res_str = validate_circuit("cir1")
@@ -77,7 +120,7 @@ class TestMCPServer(unittest.TestCase):
         res = json.loads(res_str)
         self.assertNotIn("error", res)
         self.assertEqual(res["circuit_id"], "cir1")
-        self.assertIn("Component #0", res["explanation"])
+        self.assertIn("Component 0", res["explanation"])
         self.assertIn("Node", res["explanation"])
 
 

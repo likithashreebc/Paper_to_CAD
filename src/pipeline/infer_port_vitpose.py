@@ -4,6 +4,7 @@ import os
 import re
 import json
 import math
+import torch
 from glob import glob
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -36,7 +37,7 @@ POSE2K_WTS = cfg_get("weights", "pose2k_wts", default=project_path("weights", "v
 OUT_DIR = cfg_get("paths", "ports_cls_json", default=project_path("outputs", "run1", "ports_cls", "json"))
 os.makedirs(OUT_DIR, exist_ok=True)
 
-DEVICE = "cuda"  # "cpu" 也行
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ============ 匹配阈值（keypoint -> endpoint）===========
 MATCH_TH_PX = 30.0  # fallback default

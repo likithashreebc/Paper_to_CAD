@@ -98,9 +98,8 @@ def start_web_app(host: str = "127.0.0.1", port: int = 8000, auto_open: bool = T
 
 def start_mcp_server():
     """Starts the official Paper2CAD MCP Server over stdio transport."""
-    print_banner(mode="mcp")
     from mcp_server import mcp_server
-    mcp_server.run()
+    mcp_server.run(transport="stdio")
 
 
 def main():
@@ -116,11 +115,10 @@ def main():
 
     args = parser.parse_args()
 
-    check_environment()
-
     if args.mcp:
         start_mcp_server()
     else:
+        check_environment()
         start_web_app(host=args.host, port=args.port, auto_open=not args.no_browser)
 
 

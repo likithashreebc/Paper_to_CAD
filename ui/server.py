@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure UTF-8 stdout on Windows console
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -44,6 +44,8 @@ except Exception:
     pass
 
 import uvicorn
+import cv2
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -56,7 +58,7 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "pipeline"))
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "HAWP"))
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "parseq-main"))
 
-from cad_schematic_renderer import generate_cad_schematic_files, render_circuit_graph
+from cad_schematic_renderer import render_circuit_graph
 from circuit_data_model import CircuitGraph, ComponentModel, NodeModel, TerminalModel
 from connectivity_inspector import ConnectivityInspector
 from circuit_validator import CircuitValidator
@@ -69,6 +71,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SAMPLE_DIR = REPO_ROOT / "data" / "inputs"
 GT_DIR = REPO_ROOT / "data" / "ground_truth"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+UI_LABEL_FONT = ImageFont.truetype(str(REPO_ROOT / "assets" / "fonts" / "DejaVuSans.ttf"), 14)
 
 app = FastAPI(title="PaperToCAD Studio", version="2.0")
 
@@ -116,6 +119,124 @@ def get_class_color(cls_name: str) -> str:
         if k in cls_name.lower():
             return color
     return CLASS_COLOR_PALETTE["default"]
+
+
+def remove_colored_grid(image: Image.Image) -> tuple[Image.Image, bool]:
+    """Remove dense, bright colored paper ruling while retaining dark ink."""
+    rgb = np.asarray(image.convert("RGB"))
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    grid_mask = np.where((hsv[:, :, 1] >= 55) & (hsv[:, :, 2] >= 120), 255, 0).astype(np.uint8)
+
+    # Sparse colored marks should not trigger inpainting; dense colored ruling does.
+    if cv2.countNonZero(grid_mask) < grid_mask.size * 0.2:
+        return image.copy(), False
+
+    grid_mask = cv2.dilate(
+        grid_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    cleaned = cv2.inpaint(bgr, grid_mask, 3, cv2.INPAINT_TELEA)
+    return Image.fromarray(cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB)), True
+
+
+def _looks_like_diode_symbol(image: Image.Image, bbox: List[float]) -> bool:
+    x1, y1, x2, y2 = (int(round(value)) for value in bbox)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(image.width, x2), min(image.height, y2)
+    if x2 - x1 < 24 or y2 - y1 < 24:
+        return False
+
+    crop = np.asarray(image.convert("L"))[y1:y2, x1:x2]
+    edges = cv2.Canny(crop, 40, 130)
+    min_dimension = min(crop.shape)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=max(7, int(min_dimension * 0.12)),
+        minLineLength=max(12, int(min_dimension * 0.35)),
+        maxLineGap=max(3, int(min_dimension * 0.08)),
+    )
+    if lines is None:
+        return False
+
+    diagonal_slopes = set()
+    has_cathode_bar = False
+    for (x_start, y_start, x_end, y_end) in lines[:, 0]:
+        dx, dy = int(x_end - x_start), int(y_end - y_start)
+        length = math.hypot(dx, dy)
+        angle = abs(math.degrees(math.atan2(dy, dx)))
+        if length < min_dimension * 0.35:
+            continue
+        if 25 <= angle <= 65:
+            diagonal_slopes.add(1 if dx * dy > 0 else -1)
+        elif angle >= 75 and length >= crop.shape[0] * 0.25:
+            has_cathode_bar = True
+    return len(diagonal_slopes) == 2 and has_cathode_bar
+
+
+def correct_diode_misclassified_as_battery(graph: CircuitGraph, image: Image.Image) -> bool:
+    """Correct a battery prediction only when its crop contains diode geometry."""
+    corrected = False
+    for component in graph.components:
+        if component.type != "voltage.battery" or not _looks_like_diode_symbol(image, component.bbox):
+            continue
+        component.type = "diode"
+        component.type_refined = None
+        for terminal in component.terminals:
+            if terminal.side in ("left", "top"):
+                terminal.name = "A"
+            elif terminal.side in ("right", "bottom"):
+                terminal.name = "K"
+        corrected = True
+    return corrected
+
+
+def synthesize_graph_spice_netlist(graph: CircuitGraph) -> str:
+    """Export inferred connections without inventing unknown component values."""
+    prefix_by_type = (
+        ("resistor", "R"),
+        ("capacitor", "C"),
+        ("inductor", "L"),
+        ("diode", "D"),
+        ("voltage", "V"),
+        ("current", "I"),
+        ("transistor", "Q"),
+        ("operational_amplifier", "U"),
+        ("integrated_circuit", "U"),
+    )
+    counters: Dict[str, int] = {}
+    lines = [
+        f"* Inferred from {graph.image_name}; topology follows detected net connections.",
+        "* Unknown values are intentionally not guessed; this deck may not be simulation-ready.",
+        f".TITLE {graph.image_name}",
+    ]
+    for component in graph.components:
+        component_type = component.type_refined or component.type
+        prefix = next((letter for name, letter in prefix_by_type if name in component_type.lower()), "X")
+        counters[prefix] = counters.get(prefix, 0) + 1
+        designator = component.label or f"{prefix}{counters[prefix]}"
+        terminals = sorted(component.terminals, key=lambda terminal: terminal.id)
+        if len(terminals) < 2:
+            lines.append(f"* {designator}: {component_type}; terminal connectivity is incomplete.")
+            continue
+        node_names = [
+            graph.get_node(terminal.connected_node_id).name
+            if terminal.connected_node_id is not None and graph.get_node(terminal.connected_node_id)
+            else None
+            for terminal in terminals[:2]
+        ]
+        if any(node_name is None for node_name in node_names):
+            lines.append(f"* {designator}: {component_type}; one or more nets are unknown.")
+            continue
+        if component.value:
+            lines.append(f"* {designator} {node_names[0]} {node_names[1]} {component_type} value={component.value}")
+        else:
+            lines.append(f"* {designator} {node_names[0]} {node_names[1]} {component_type} VALUE_REQUIRED")
+    lines.append(".END")
+    return "\n".join(lines) + "\n"
 
 
 def get_yolo_model():
@@ -650,90 +771,82 @@ async def process_circuit(
     # Load image
     orig_img = Image.open(input_img_path).convert("RGB")
     img_w, img_h = orig_img.size
+    detection_img, grid_removed = remove_colored_grid(orig_img)
+    detection_img_path = job_dir / "detection_input.jpg"
+    if grid_removed:
+        detection_img.save(detection_img_path, "JPEG", quality=95)
+    else:
+        detection_img_path = input_img_path
 
     start_time = time.time()
     steps_log = []
     steps_log.append(f"[INIT] Processing image: {image_name} ({img_w}x{img_h} px)")
+    if grid_removed:
+        steps_log.append("[INFO] Removed dense colored paper ruling for detection and OCR.")
+    if not 0.0 <= conf_threshold <= 1.0:
+        raise HTTPException(status_code=400, detail="conf_threshold must be between 0 and 1.")
 
-    # 1. YOLOv10 Detection
-    steps_log.append("[1/5] Running YOLOv10 Component Detection...")
-    yolo = get_yolo_model()
-    yolo_res = yolo.predict(
-        source=str(input_img_path),
-        conf=conf_threshold,
-        iou=0.40,
-        device=device,
-        verbose=False
-    )
-    
-    components = []
-    text_boxes = []
-    boxes = yolo_res[0].boxes
-    cls_names_map = yolo.names
+    gt_json_path = GT_DIR / f"{image_name}.gt.json"
+    if gt_json_path.is_file():
+        graph = CircuitGraph.from_final_json(gt_json_path)
+        steps_log.append("[INFO] Using the curated connectivity graph for this sample.")
+    else:
+        steps_log.append("[1/7] Running component, OCR, wire, and connectivity inference...")
+        from src.mcp_server import process_sketch
 
-    for idx, b in enumerate(boxes):
-        c_id = int(b.cls[0].item())
-        conf = float(b.conf[0].item())
-        xyxy = [float(x) for x in b.xyxy[0].tolist()]
-        c_name = cls_names_map.get(c_id, f"class_{c_id}")
-        
-        comp_obj = {
-            "id": idx,
-            "cls_id": c_id,
-            "cls_name": c_name,
-            "color": get_class_color(c_name),
-            "confidence": round(conf, 4),
-            "bbox": [round(coord, 1) for coord in xyxy],
-            "text_label": "",
-            "crop_url": ""
-        }
-        components.append(comp_obj)
-        if c_name == "text":
-            text_boxes.append(comp_obj)
+        pipeline_result = json.loads(process_sketch(
+            str(detection_img_path),
+            conf_threshold=conf_threshold,
+            device=device,
+        ))
+        if pipeline_result.get("status") != "success" or not pipeline_result.get("graph"):
+            detail = pipeline_result.get("error", "The topology pipeline did not produce a circuit graph.")
+            raise HTTPException(status_code=422, detail=detail)
+        graph = CircuitGraph(**pipeline_result["graph"])
+        if correct_diode_misclassified_as_battery(graph, detection_img):
+            steps_log.append("[INFO] Corrected a battery/diode classification using the detected symbol shape.")
+        graph.metadata["source"] = "topology_pipeline"
+        graph.metadata["pipeline_job_id"] = pipeline_result.get("job_id")
+        steps_log.append(
+            f"[OK] Inferred {len(graph.nodes)} electrical nets from "
+            f"{sum(len(node.connections) for node in graph.nodes)} terminal connections."
+        )
 
-    # Cross-Class Non-Maximum Suppression to remove duplicate phantom components
-    components = suppress_duplicate_components(components)
-
-    steps_log.append(f"[OK] Detected {len(components)} physical components ({len(text_boxes)} text labels)")
-
-    # 2. Crop Components and save crops
-    steps_log.append("[2/5] Cropping detected components for inspection...")
-    for comp in components:
-        bbox = comp["bbox"]
-        x1 = max(0, int(bbox[0]))
-        y1 = max(0, int(bbox[1]))
-        x2 = min(img_w, int(bbox[2]))
-        y2 = min(img_h, int(bbox[3]))
-        
+    graph.image_name = image_name
+    graph_components = []
+    for graph_component in graph.components:
+        component_type = graph_component.type_refined or graph_component.type
+        bbox = graph_component.bbox
+        x1, y1 = max(0, int(bbox[0])), max(0, int(bbox[1]))
+        x2, y2 = min(img_w, int(bbox[2])), min(img_h, int(bbox[3]))
+        crop_url = ""
         if x2 > x1 and y2 > y1:
-            pad = 4
-            crop_box = (
-                max(0, x1 - pad),
-                max(0, y1 - pad),
-                min(img_w, x2 + pad),
-                min(img_h, y2 + pad)
-            )
-            crop_im = orig_img.crop(crop_box)
-            crop_filename = f"comp_{comp['id']}_{comp['cls_name']}.png"
+            crop_filename = f"comp_{graph_component.id}_{graph_component.type}.png"
             crop_path = crops_dir / crop_filename
-            crop_im.save(crop_path, format="PNG")
-            comp["crop_url"] = f"/api/jobs/{job_id}/crops/{crop_filename}"
+            orig_img.crop((max(0, x1 - 4), max(0, y1 - 4), min(img_w, x2 + 4), min(img_h, y2 + 4))).save(
+                crop_path,
+                format="PNG",
+            )
+            crop_url = f"/api/jobs/{job_id}/crops/{crop_filename}"
 
-    # 3. Text OCR via PARSeq or Ground Truth fusion
-    steps_log.append("[3/5] Extracting component values & text labels (PARSeq OCR)...")
-    if text_boxes:
-        try:
-            texts = run_parseq_ocr(orig_img, text_boxes, device=device)
-            for tb, text in zip(text_boxes, texts):
-                tb["text_label"] = text.strip()
-
-            # Smart multi-label association (Designator + Value)
-            smart_bind_text_labels(components, text_boxes)
-        except Exception as e:
-            steps_log.append(f"[WARN] PARSeq OCR error: {e}")
+        graph_components.append({
+            "id": graph_component.id,
+            "cls_id": graph_component.cls_id,
+            "cls_name": graph_component.type,
+            "cls_name_refined": graph_component.type_refined,
+            "color": get_class_color(component_type),
+            "confidence": round(graph_component.confidence, 4),
+            "bbox": [round(coord, 1) for coord in bbox],
+            "designator": graph_component.label or "",
+            "value": graph_component.value or "",
+            "text_label": graph_component.value or graph_component.label or "",
+            "crop_url": crop_url,
+        })
+    components = graph_components
+    label_count = sum(bool(component["value"] or component["designator"]) for component in components)
 
     # 4. Generate Annotated Overlay Image
-    steps_log.append("[4/5] Rendering high-resolution annotated diagram...")
+    steps_log.append("[2/7] Rendering the graph components over the original sketch...")
     annotated_img = orig_img.copy()
     draw = ImageDraw.Draw(annotated_img, "RGBA")
     
@@ -763,53 +876,35 @@ async def process_circuit(
         label_text += f" ({comp['confidence']:.2f})"
         
         # Background pill for label
-        tw = max(50.0, len(label_text) * 7.5 + 8)
-        th = 18
+        text_bounds = draw.textbbox((0, 0), label_text, font=UI_LABEL_FONT)
+        tw = max(50.0, text_bounds[2] - text_bounds[0] + 8)
+        th = max(18, text_bounds[3] - text_bounds[1] + 4)
         draw.rectangle([bbox[0], max(0, bbox[1] - th - 3), bbox[0] + tw, max(0, bbox[1])], fill=rgb)
-        draw.text((bbox[0] + 4, max(0, bbox[1] - th - 1)), label_text, fill=(255, 255, 255, 255))
+        draw.text(
+            (bbox[0] + 4, max(0, bbox[1] - th - 1)),
+            label_text,
+            fill=(255, 255, 255, 255),
+            font=UI_LABEL_FONT,
+        )
 
     annotated_path = job_dir / "annotated.jpg"
     annotated_img.save(annotated_path, "JPEG", quality=95)
 
-    # 5. SPICE Netlist Synthesis
-    steps_log.append("[5/5] Synthesizing SPICE circuit netlist & graph...")
-    
-    # Check if a curated GT netlist exists for exact fidelity on sample circuits
-    gt_json_path = GT_DIR / f"{image_name}.gt.json"
-    spice_netlist_text = ""
-    if gt_json_path.exists():
-        try:
-            from build_spice_netlists import export_one
-            spice_file = export_one(str(gt_json_path), str(job_dir))
-            with open(spice_file, "r", encoding="utf-8") as sf:
-                spice_netlist_text = sf.read()
-        except Exception:
-            pass
-
-        try:
-            with open(gt_json_path, "r", encoding="utf-8") as gf:
-                gt_data = json.load(gf)
-            gt_texts = {t.get("matched_component_id"): t.get("text") for t in gt_data.get("texts", []) if "matched_component_id" in t}
-            for gt_c in gt_data.get("components", []):
-                gt_cx = (gt_c["bbox"][0] + gt_c["bbox"][2]) / 2.0
-                gt_cy = (gt_c["bbox"][1] + gt_c["bbox"][3]) / 2.0
-                for c in components:
-                    c_cx = (c["bbox"][0] + c["bbox"][2]) / 2.0
-                    c_cy = (c["bbox"][1] + c["bbox"][3]) / 2.0
-                    if math.hypot(c_cx - gt_cx, c_cy - gt_cy) < 60:
-                        if "cls_name_refined" in gt_c:
-                            c["cls_name_refined"] = gt_c["cls_name_refined"]
-                        if gt_c["id"] in gt_texts and not c.get("text_label"):
-                            c["text_label"] = gt_texts[gt_c["id"]]
-        except Exception:
-            pass
-
-    if not spice_netlist_text:
-        spice_netlist_text = synthesize_spice_netlist(image_name, components)
+    # 5. Topology-aware SPICE Netlist Synthesis
+    steps_log.append("[5/7] Exporting net connections without guessing missing values...")
+    if gt_json_path.is_file():
+        from build_spice_netlists import export_one
+        spice_file = export_one(str(gt_json_path), str(job_dir))
+        spice_netlist_text = Path(spice_file).read_text(encoding="utf-8")
+    else:
+        spice_netlist_text = synthesize_graph_spice_netlist(graph)
 
     spice_file_path = job_dir / f"{image_name}.cir"
     with open(spice_file_path, "w", encoding="utf-8") as sf:
         sf.write(spice_netlist_text)
+
+    graph_path = job_dir / "circuit_graph.json"
+    graph_path.write_text(json.dumps(graph.to_dict(), indent=2), encoding="utf-8")
 
     # Save JSON summary
     graph_json = {
@@ -819,7 +914,14 @@ async def process_circuit(
         "height": img_h,
         "processing_time_sec": round(time.time() - start_time, 2),
         "total_components": len([c for c in components if c["cls_name"] != "text"]),
-        "total_labels": len(text_boxes),
+        "total_labels": label_count,
+        "topology": {
+            "inferred": bool(graph.nodes),
+            "node_count": len(graph.nodes),
+            "connected_terminal_count": sum(len(node.connections) for node in graph.nodes),
+            "wire_count": len(graph.wires),
+            "source": graph.metadata.get("source", "curated_ground_truth"),
+        },
         "components": components,
         "spice_netlist": spice_netlist_text
     }
@@ -828,11 +930,11 @@ async def process_circuit(
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(graph_json, jf, indent=2)
 
-    # 6. Computerized CAD Schematic Generation
-    steps_log.append("[6/6] Drawing computerized schematic with standard IEEE electronic symbols...")
-    schem_map = generate_cad_schematic_files(image_name, img_w, img_h, components, job_dir)
+    # 6. Render from the inferred graph instead of component positions.
+    steps_log.append("[6/7] Rendering the detected components and wire topology...")
+    render_circuit_graph(graph, job_dir)
 
-    steps_log.append(f"[DONE] Circuit detected & computerized schematic drawn in {time.time() - start_time:.2f}s!")
+    steps_log.append(f"[DONE] Circuit graph and CAD views generated in {time.time() - start_time:.2f}s!")
 
     # Calculate class breakdown stats
     breakdown = {}
@@ -847,7 +949,8 @@ async def process_circuit(
         "dimensions": {"width": img_w, "height": img_h},
         "stats": {
             "total_components": len([c for c in components if c["cls_name"] != "text"]),
-            "total_labels": len(text_boxes),
+            "total_labels": label_count,
+            "total_nets": len(graph.nodes),
             "breakdown": breakdown,
             "processing_time": f"{time.time() - start_time:.2f}s"
         },
@@ -859,6 +962,7 @@ async def process_circuit(
             "schematic_schemdraw": f"/api/jobs/{job_id}/schematic/schemdraw"
         },
         "components": components,
+        "topology": graph_json["topology"],
         "spice_netlist": spice_netlist_text,
         "logs": steps_log
     }
@@ -933,10 +1037,16 @@ def get_job_annotated(job_id: str):
                 elif comp.label:
                     label_text += f": {comp.label}"
                     
-                tw = max(len(label_text) * 8 + 10, 50)
-                th = 18
+                text_bounds = draw.textbbox((0, 0), label_text, font=UI_LABEL_FONT)
+                tw = max(text_bounds[2] - text_bounds[0] + 10, 50)
+                th = max(18, text_bounds[3] - text_bounds[1] + 4)
                 draw.rectangle([bbox[0], max(0, bbox[1] - th - 3), bbox[0] + tw, max(0, bbox[1])], fill=rgb)
-                draw.text((bbox[0] + 5, max(0, bbox[1] - th - 1)), label_text, fill=(255, 255, 255, 255))
+                draw.text(
+                    (bbox[0] + 5, max(0, bbox[1] - th - 1)),
+                    label_text,
+                    fill=(255, 255, 255, 255),
+                    font=UI_LABEL_FONT,
+                )
                 
                 if comp.terminals:
                     for term in comp.terminals:
@@ -1186,6 +1296,67 @@ def validate_job_circuit(job_id: str):
     }
 
 
+def _persist_job_graph_updates(job_id: str, graph: CircuitGraph) -> str:
+    job_dir = UPLOAD_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "circuit_graph.json").write_text(
+        json.dumps(graph.to_dict(), indent=2),
+        encoding="utf-8",
+    )
+
+    spice_netlist = synthesize_graph_spice_netlist(graph)
+    spice_path = next(iter(job_dir.glob("*.cir")), job_dir / f"{graph.image_name}.cir")
+    spice_path.write_text(spice_netlist, encoding="utf-8")
+
+    summary_path = job_dir / "circuit.json"
+    if summary_path.is_file():
+        with summary_path.open("r", encoding="utf-8") as f:
+            summary = json.load(f)
+        components_by_id = {component.id: component for component in graph.components}
+        for component_data in summary.get("components", []):
+            component = components_by_id.get(component_data.get("id"))
+            if component:
+                component_data["value"] = component.value or ""
+                component_data["designator"] = component.label or component_data.get("designator", "")
+                component_data["text_label"] = component.value or component.label or ""
+                component_data["cls_name"] = component.type
+                component_data["cls_name_refined"] = component.type_refined
+        summary["total_labels"] = sum(bool(c.value or c.label) for c in graph.components)
+        summary["spice_netlist"] = spice_netlist
+        summary["topology"] = {
+            **summary.get("topology", {}),
+            "inferred": bool(graph.nodes),
+            "node_count": len(graph.nodes),
+            "connected_terminal_count": sum(len(node.connections) for node in graph.nodes),
+            "wire_count": len(graph.wires),
+            "source": graph.metadata.get("source", "curated_ground_truth"),
+        }
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    input_path = job_dir / "input.jpg"
+    if input_path.is_file():
+        image = Image.open(input_path).convert("RGB")
+        draw = ImageDraw.Draw(image, "RGBA")
+        for component in graph.components:
+            if len(component.bbox) != 4:
+                continue
+            x1, y1, x2, y2 = component.bbox
+            color = get_class_color(component.type_refined or component.type)
+            rgb = tuple(int(color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+            label = component.display_type
+            if component.value:
+                label += f": {component.value}"
+            draw.rectangle([x1, y1, x2, y2], outline=rgb, width=3)
+            bounds = draw.textbbox((0, 0), label, font=UI_LABEL_FONT)
+            label_height = max(18, bounds[3] - bounds[1] + 4)
+            draw.rectangle([x1, max(0, y1 - label_height - 3), x1 + bounds[2] + 8, y1], fill=rgb)
+            draw.text((x1 + 4, max(0, y1 - label_height - 1)), label, fill="white", font=UI_LABEL_FONT)
+        image.save(job_dir / "annotated.jpg", "JPEG", quality=95)
+
+    render_circuit_graph(graph, job_dir)
+    return spice_netlist
+
+
 @app.post("/api/jobs/{job_id}/correct")
 async def apply_job_correction(job_id: str, payload: Dict[str, Any]):
     """
@@ -1202,15 +1373,7 @@ async def apply_job_correction(job_id: str, payload: Dict[str, Any]):
     if not ok:
         return JSONResponse(status_code=400, content={"success": False, "message": message})
 
-    job_dir = UPLOAD_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Save updated circuit_graph.json
-    with open(job_dir / "circuit_graph.json", "w", encoding="utf-8") as f:
-        f.write(json.dumps(graph.to_dict(), indent=2))
-
-    # 2. Re-render CAD Schematics with updated values & topology
-    render_circuit_graph(graph, job_dir)
+    spice_netlist = _persist_job_graph_updates(job_id, graph)
 
     # 3. Re-run validation
     validator = CircuitValidator(graph)
@@ -1223,7 +1386,9 @@ async def apply_job_correction(job_id: str, payload: Dict[str, Any]):
         "summary": inspector.get_summary(),
         "components": inspector.inspect_components(),
         "nodes": inspector.inspect_nodes(),
-        "findings": [f.model_dump() for f in findings]
+        "findings": [f.model_dump() for f in findings],
+        "spice_netlist": spice_netlist,
+        "graph": graph.to_dict(),
     }
 
 
@@ -1269,23 +1434,32 @@ def simulate_job_circuit(job_id: str, analysis: str = Form("OP")):
 
 @app.get("/api/assistant/status")
 def get_assistant_status():
-    """Returns current status of Groq LLM integration."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(override=True)
-    except Exception:
-        pass
-
-    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    has_groq = bool(groq_key and groq_key != "your_groq_api_key_here")
-    model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
-    
+    """Returns whether an external LLM is configured, without claiming connectivity."""
+    assistant = AICircuitAssistant()
+    local_endpoint_without_key = (
+        assistant.provider == "OpenAI-compatible LLM"
+        and assistant.base_url is not None
+        and not any(host in assistant.base_url.lower() for host in ("api.openai.com", "api.groq.com"))
+    )
+    has_llm = bool(
+        assistant.base_url
+        and assistant.model
+        and (assistant.api_key or local_endpoint_without_key)
+        and assistant.api_key != "your_groq_api_key_here"
+    )
     return {
         "status": "ready",
-        "has_groq": has_groq,
-        "provider": "Groq" if has_groq else "Deterministic Grounded Engine",
-        "model": model if has_groq else "None (Deterministic)",
-        "hint": "Set GROQ_API_KEY in .env to enable ultra-fast conversational reasoning." if not has_groq else f"Groq LLM ({model}) connected and active."
+        "has_groq": has_llm,
+        "has_llm": has_llm,
+        "provider": assistant.provider,
+        "hint": (
+            f"{assistant.provider} is configured; network connectivity is checked when you send a message."
+            if has_llm
+            else (
+                "Set GROQ_API_KEY, LLM_API_KEY, or OPENAI_API_KEY for a hosted provider, "
+                "or set LLM_BASE_URL and LLM_MODEL for an OpenAI-compatible local model."
+            )
+        )
     }
 
 
@@ -1359,7 +1533,6 @@ async def chat_job_assistant(job_id: str, payload: Dict[str, Any]):
         "question": user_question,
         "answer": answer,
         "provider": getattr(assistant, "provider", "Groq"),
-        "model": getattr(assistant, "model", None)
     }
 
 
@@ -1370,7 +1543,7 @@ def get_mcp_tools():
         "status": "online",
         "transport": "stdio / JSON-RPC 2.0",
         "protocol_version": "2024-11-05",
-        "sdk_version": "mcp-2.3.0",
+        "sdk_version": "mcp 1.x",
         "tools": [
             {
                 "name": "inspect_circuit",

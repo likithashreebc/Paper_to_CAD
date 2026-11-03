@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "papertocad": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "${workspaceFolder}/main.py",
+        "--mcp"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}

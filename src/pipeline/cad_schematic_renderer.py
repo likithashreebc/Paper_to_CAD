@@ -251,8 +251,8 @@ class CADSchematicRenderer:
         </pattern>
         <style>
           .cad-text {{ font-family: 'JetBrains Mono', 'Plus Jakarta Sans', monospace, sans-serif; font-weight: 600; }}
-          .cad-val {{ font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 700; fill: {self.subtext_color}; paint-order: stroke fill; stroke: {self.bg_color}; stroke-width: 3.5px; stroke-linejoin: round; stroke-linecap: round; }}
-          .cad-lbl {{ font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 800; fill: {self.text_color}; paint-order: stroke fill; stroke: {self.bg_color}; stroke-width: 4px; stroke-linejoin: round; stroke-linecap: round; letter-spacing: 0.5px; }}
+          .cad-val {{ font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; fill: {self.subtext_color}; paint-order: stroke fill; stroke: {self.bg_color}; stroke-width: 4px; stroke-linejoin: round; stroke-linecap: round; }}
+          .cad-lbl {{ font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 800; fill: {self.text_color}; paint-order: stroke fill; stroke: {self.bg_color}; stroke-width: 4px; stroke-linejoin: round; stroke-linecap: round; letter-spacing: 0.5px; }}
           .cad-component-group {{ cursor: pointer; transition: filter 0.2s ease, transform 0.2s ease; }}
           .cad-component-group:hover {{ filter: drop-shadow(0 0 10px {self.wire_color}); }}
           .cad-component-group.selected {{ filter: drop-shadow(0 0 14px #f59e0b); }}
@@ -621,6 +621,255 @@ class CADSchematicRenderer:
         svg.append('</svg>')
         return "\n".join(svg)
 
+    def render_connected_graph_svg(self, graph: Any) -> str:
+        """Render detected wire segments and components without inventing connections."""
+        view_w, view_h = 1100, 680
+        margin_x, margin_y = 70.0, 85.0
+        scale = min(
+            (view_w - 2 * margin_x) / max(float(graph.width), 1.0),
+            (view_h - 2 * margin_y) / max(float(graph.height), 1.0),
+        )
+        offset_x = (view_w - graph.width * scale) / 2.0
+        offset_y = (view_h - graph.height * scale) / 2.0
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            return offset_x + x * scale, offset_y + y * scale
+
+        svg = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {view_w} {view_h}" width="{view_w}" height="{view_h}">',
+            '<defs><pattern id="graphGrid" width="20" height="20" patternUnits="userSpaceOnUse">'
+            f'<path d="M 20 0 L 0 0 0 20" fill="none" stroke="{self.grid_color}" stroke-width="1"/>'
+            '</pattern><style>'
+            f'.cad-lbl {{ font-family: monospace; font-size: 22px; font-weight: 700; fill: {self.text_color}; '
+            f'paint-order: stroke fill; stroke: {self.bg_color}; stroke-width: 4px; stroke-linejoin: round; }}'
+            f'.cad-val {{ font-family: monospace; font-size: 24px; font-weight: 700; fill: {self.subtext_color}; '
+            f'paint-order: stroke fill; stroke: {self.bg_color}; stroke-width: 4px; stroke-linejoin: round; }}'
+            '.cad-missing { font-family: monospace; font-size: 18px; font-weight: 700; fill: #f59e0b; '
+            f'paint-order: stroke fill; stroke: {self.bg_color}; stroke-width: 4px; stroke-linejoin: round; }}'
+            '</style></defs>',
+            f'<rect width="{view_w}" height="{view_h}" fill="{self.bg_color}"/>',
+            f'<rect width="{view_w}" height="{view_h}" fill="url(#graphGrid)"/>',
+            f'<rect x="20" y="20" width="{view_w - 40}" height="{view_h - 40}" fill="none" stroke="{self.border_color}" stroke-width="2"/>',
+            f'<text x="40" y="52" font-size="16" fill="{self.text_color}" class="cad-text">CIRCUIT: {graph.image_name.upper()}</text>',
+            f'<g id="wires" stroke="{self.wire_color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none">',
+        ]
+
+        valid_node_ids = {node.id for node in graph.nodes}
+        rendered_wires = []
+        rendered_node_ids = set()
+        endpoint_counts: Dict[Tuple[int, int, int], int] = {}
+        for wire in graph.wires:
+            if wire.node_id not in valid_node_ids:
+                continue
+            rendered_node_ids.add(wire.node_id)
+            start = transform(wire.start_x, wire.start_y)
+            end = transform(wire.end_x, wire.end_y)
+            rendered_wires.append((wire, start, end))
+            for x, y in (start, end):
+                key = (wire.node_id, round(x), round(y))
+                endpoint_counts[key] = endpoint_counts.get(key, 0) + 1
+            if abs(end[0] - start[0]) >= abs(end[1] - start[1]):
+                corner = (end[0], start[1])
+            else:
+                corner = (start[0], end[1])
+            svg.append(
+                f'<path d="M {start[0]:.1f} {start[1]:.1f} '
+                f'L {corner[0]:.1f} {corner[1]:.1f} '
+                f'L {end[0]:.1f} {end[1]:.1f}"/>'
+            )
+
+        terminal_points_by_node: Dict[int, List[Tuple[float, float]]] = {}
+        for component in graph.components:
+            for terminal in component.terminals:
+                if terminal.connected_node_id in valid_node_ids:
+                    terminal_points_by_node.setdefault(terminal.connected_node_id, []).append(
+                        transform(terminal.x, terminal.y)
+                    )
+
+        for node_id, terminal_points in terminal_points_by_node.items():
+            if node_id in rendered_node_ids or len(terminal_points) < 2:
+                continue
+            connected = {0}
+            while len(connected) < len(terminal_points):
+                start_index, end_index = min(
+                    (
+                        (start_index, end_index)
+                        for start_index in connected
+                        for end_index in range(len(terminal_points))
+                        if end_index not in connected
+                    ),
+                    key=lambda pair: math.dist(terminal_points[pair[0]], terminal_points[pair[1]]),
+                )
+                start = terminal_points[start_index]
+                end = terminal_points[end_index]
+                if abs(end[0] - start[0]) >= abs(end[1] - start[1]):
+                    corner = (end[0], start[1])
+                else:
+                    corner = (start[0], end[1])
+                svg.append(
+                    f'<path data-node-id="{node_id}" d="M {start[0]:.1f} {start[1]:.1f} '
+                    f'L {corner[0]:.1f} {corner[1]:.1f} L {end[0]:.1f} {end[1]:.1f}"/>'
+                )
+                connected.add(end_index)
+            rendered_wires.append((None, terminal_points[0], terminal_points[-1]))
+        svg.append('</g>')
+        if not rendered_wires:
+            svg.append(
+                f'<text x="{view_w / 2:.1f}" y="{view_h - 42:.1f}" text-anchor="middle" '
+                f'font-size="14" fill="#f59e0b" class="cad-text">'
+                'TOPOLOGY NOT INFERRED - COMPONENTS ONLY</text>'
+            )
+
+        prefix_by_type = (
+            ("resistor", "R"),
+            ("capacitor", "C"),
+            ("inductor", "L"),
+            ("diode", "D"),
+            ("voltage", "V"),
+            ("current", "I"),
+            ("transistor", "Q"),
+            ("operational_amplifier", "U"),
+            ("integrated_circuit", "U"),
+        )
+        prefix_counts: Dict[str, int] = {}
+        terminal_positions: Dict[int, List[Tuple[float, float]]] = {}
+        for component in graph.components:
+            bbox = component.bbox if len(component.bbox) == 4 else [0.0, 0.0, 0.0, 0.0]
+            cx, cy = transform((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
+            terminals = sorted(component.terminals, key=lambda terminal: terminal.id)
+            comp_type = (component.type_refined or component.type or "").lower()
+            if len(terminals) >= 2:
+                if len(terminals) > 2 and any(
+                    kind in comp_type for kind in ("operational_amplifier", "opamp", "transistor", "fet", "mosfet")
+                ):
+                    cx, cy = transform((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
+                    is_horiz = True
+                    symbol_scale = max(
+                        0.55,
+                        min(max(abs(bbox[2] - bbox[0]), abs(bbox[3] - bbox[1])) * scale / 90.0, 1.8),
+                    )
+                else:
+                    first, second = terminals[:2]
+                    p1, p2 = transform(first.x, first.y), transform(second.x, second.y)
+                    cx, cy = (p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0
+                    sides = {first.side, second.side}
+                    if sides == {"left", "right"}:
+                        is_horiz = True
+                    elif sides == {"top", "bottom"}:
+                        is_horiz = False
+                    else:
+                        is_horiz = abs(p2[0] - p1[0]) >= abs(p2[1] - p1[1])
+                    symbol_scale = max(0.55, min(math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / 90.0, 1.8))
+                terminal_positions[component.id] = [transform(terminal.x, terminal.y) for terminal in terminals]
+            else:
+                is_horiz = abs(bbox[2] - bbox[0]) >= abs(bbox[3] - bbox[1])
+                symbol_scale = 1.0
+
+            prefix = next((letter for key, letter in prefix_by_type if key in comp_type), "X")
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+            designator = component.label or f"{prefix}{prefix_counts[prefix]}"
+            value = component.value or ""
+            svg.append(self._render_symbol_svg(
+                comp_type,
+                cx,
+                cy,
+                is_horiz,
+                designator,
+                value,
+                component.id,
+                symbol_scale,
+            ))
+
+            if len(terminals) > 2 and terminal_positions.get(component.id):
+                normalized_type = comp_type.replace("operational_amplifier", "opamp")
+                if "opamp" in normalized_type or "amplifier" in normalized_type:
+                    pin_by_name = {
+                        "in-": (-45.0, -12.0),
+                        "inv": (-45.0, -12.0),
+                        "in+": (-45.0, 12.0),
+                        "noninv": (-45.0, 12.0),
+                        "out": (45.0, 0.0),
+                    }
+                    fallback_pins = [(-45.0, -12.0), (-45.0, 12.0), (45.0, 0.0)]
+                elif "bjt" in normalized_type or "transistor" in normalized_type and "fet" not in normalized_type:
+                    pin_by_name = {
+                        "b": (-40.0, 0.0),
+                        "base": (-40.0, 0.0),
+                        "c": (14.0, -40.0),
+                        "collector": (14.0, -40.0),
+                        "e": (14.0, 40.0),
+                        "emitter": (14.0, 40.0),
+                    }
+                    fallback_pins = [(-40.0, 0.0), (14.0, -40.0), (14.0, 40.0)]
+                else:
+                    pin_by_name = {
+                        "g": (-45.0, 0.0),
+                        "gate": (-45.0, 0.0),
+                        "d": (18.0, -40.0),
+                        "drain": (18.0, -40.0),
+                        "s": (18.0, 40.0),
+                        "source": (18.0, 40.0),
+                    }
+                    fallback_pins = [(-45.0, 0.0), (18.0, -40.0), (18.0, 40.0)]
+
+                available_pins = list(fallback_pins)
+                for terminal, point in zip(terminals, terminal_positions[component.id]):
+                    normalized_name = re.sub(r"[^a-z0-9+-]", "", terminal.name.lower())
+                    local_pin = pin_by_name.get(normalized_name)
+                    if local_pin in available_pins:
+                        available_pins.remove(local_pin)
+                    else:
+                        local_pin = min(
+                            available_pins or fallback_pins,
+                            key=lambda pin: math.hypot(
+                                point[0] - (cx + pin[0] * symbol_scale),
+                                point[1] - (cy + pin[1] * symbol_scale),
+                            ),
+                        )
+                        if local_pin in available_pins:
+                            available_pins.remove(local_pin)
+
+                    local_x, local_y = local_pin
+                    pin_x = cx + local_x * symbol_scale
+                    pin_y = cy + local_y * symbol_scale
+                    svg.append(
+                        f'<line data-terminal-id="{terminal.id}" x1="{point[0]:.1f}" y1="{point[1]:.1f}" '
+                        f'x2="{pin_x:.1f}" y2="{pin_y:.1f}" '
+                        f'stroke="{self.wire_color}" stroke-width="3" stroke-linecap="round"/>'
+                    )
+            elif len(terminals) >= 2:
+                if is_horiz:
+                    symbol_pins = [
+                        (cx - 45.0 * symbol_scale, cy),
+                        (cx + 45.0 * symbol_scale, cy),
+                    ]
+                else:
+                    symbol_pins = [
+                        (cx, cy - 45.0 * symbol_scale),
+                        (cx, cy + 45.0 * symbol_scale),
+                    ]
+                for terminal, pin, point in zip(terminals[:2], symbol_pins, terminal_positions[component.id]):
+                    if terminal.side in ("right", "bottom"):
+                        pin = symbol_pins[1]
+                    elif terminal.side in ("left", "top"):
+                        pin = symbol_pins[0]
+                    svg.append(
+                        f'<line data-terminal-id="{terminal.id}" x1="{point[0]:.1f}" y1="{point[1]:.1f}" '
+                        f'x2="{pin[0]:.1f}" y2="{pin[1]:.1f}" '
+                        f'stroke="{self.wire_color}" stroke-width="3" stroke-linecap="round"/>'
+                    )
+
+        for (node_id, x, y), count in endpoint_counts.items():
+            node = next((item for item in graph.nodes if item.id == node_id), None)
+            if count >= 3 and node and len(node.connections) >= 3:
+                svg.append(
+                    f'<circle cx="{x}" cy="{y}" r="5" fill="{self.junction_color}" '
+                    'stroke="none" data-node-id="{}"/>'.format(node_id)
+                )
+
+        svg.append('</svg>')
+        return "\n".join(svg)
+
     def _render_symbol_svg(
         self,
         c_type: str,
@@ -629,7 +878,8 @@ class CADSchematicRenderer:
         is_horiz: bool,
         desig: str,
         val_text: str,
-        comp_id: Optional[int] = None
+        comp_id: Optional[int] = None,
+        symbol_scale: float = 1.0,
     ) -> str:
         """
         Emits clean SVG elements for a single standardized electronic component symbol.
@@ -637,7 +887,7 @@ class CADSchematicRenderer:
         """
         rot = 0 if is_horiz else 90
         comp_attr = f' data-comp-id="{comp_id}"' if comp_id is not None else ""
-        elements = [f'<g class="cad-component-group"{comp_attr} transform="translate({cx:.1f}, {cy:.1f}) rotate({rot})">']
+        elements = [f'<g class="cad-component-group"{comp_attr} transform="translate({cx:.1f}, {cy:.1f}) rotate({rot}) scale({symbol_scale:.3f})">']
 
         if "resistor" in c_type:
             # IEEE standard zig-zag resistor (90px total span, 26px height)
@@ -815,6 +1065,7 @@ class CADSchematicRenderer:
 
         has_val = bool(clean_val and clean_val != desig)
         is_circle = any(k in c_type for k in ("current", "voltage", "source", "battery"))
+        needs_value = any(k in c_type for k in ("resistor", "capacitor", "inductor", "voltage", "current"))
 
         if "vss" in c_type or "rail" in c_type or "vcc" in c_type:
             rail_text = clean_val or desig or "VCC"
@@ -833,6 +1084,9 @@ class CADSchematicRenderer:
             if has_val:
                 val_y = cy + (36.0 if is_circle else 30.0)
                 elements.append(f'<text x="{cx:.1f}" y="{val_y:.1f}" text-anchor="middle" class="cad-val">{clean_val}</text>')
+            elif needs_value:
+                val_y = cy + (36.0 if is_circle else 30.0)
+                elements.append(f'<text x="{cx:.1f}" y="{val_y:.1f}" text-anchor="middle" class="cad-missing">VALUE REQUIRED</text>')
             elements.append(f'</g>')
         else:
             # Vertical component: labels placed clearly on the right side
@@ -846,6 +1100,8 @@ class CADSchematicRenderer:
             else:
                 lbl_y = cy + 5.0
                 elements.append(f'<text x="{lbl_x:.1f}" y="{lbl_y:.1f}" text-anchor="start" class="cad-lbl">{desig}</text>')
+                if needs_value:
+                    elements.append(f'<text x="{lbl_x:.1f}" y="{cy + 25.0:.1f}" text-anchor="start" class="cad-missing">VALUE REQUIRED</text>')
             elements.append(f'</g>')
 
         return "\n".join(elements)
@@ -2739,21 +2995,22 @@ def generate_cad_schematic_files(
 
 def render_circuit_graph(graph: Any, output_dir: Path) -> Dict[str, str]:
     """
-    Renders digital schematic files directly from a Paper2CAD CircuitGraph instance.
+    Renders a CircuitGraph using its detected wire segments and node memberships.
     """
-    comps_dict = []
-    for c in graph.components:
-        comps_dict.append({
-            "id": c.id,
-            "cls_id": c.cls_id,
-            "cls_name": c.type,
-            "cls_name_refined": c.type_refined,
-            "designator": c.label,
-            "text_label": c.value or c.label,
-            "value": c.value,
-            "confidence": c.confidence,
-            "bbox": c.bbox,
-            "is_uncertain": any(u.target_id == c.id for u in getattr(graph, "uncertainties", []))
-        })
-    return generate_cad_schematic_files(graph.image_name, graph.width, graph.height, comps_dict, output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_files = {
+        "cad_dark_svg": f"{graph.image_name}_cad_dark.svg",
+        "cad_light_svg": f"{graph.image_name}_cad_light.svg",
+        "schemdraw_svg": f"{graph.image_name}_schemdraw.svg",
+    }
 
+    for theme, filename in (
+        ("dark", output_files["cad_dark_svg"]),
+        ("light", output_files["cad_light_svg"]),
+        ("dark", output_files["schemdraw_svg"]),
+    ):
+        renderer = CADSchematicRenderer(theme=theme)
+        svg = renderer.render_connected_graph_svg(graph)
+        (output_dir / filename).write_text(svg, encoding="utf-8")
+
+    return output_files

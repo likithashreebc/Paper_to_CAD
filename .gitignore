@@ -62,6 +62,8 @@ configs/paths.local.yaml
 .idea/
 *.sublime-project
 *.sublime-workspace
+!.vscode/
+!.vscode/mcp.json
 
 # Operating System files
 .DS_Store

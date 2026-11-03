@@ -10,11 +10,15 @@ PaperToCAD is an end-to-end Computer Vision and Deep Learning system that transf
 - **Optical Character Recognition (OCR)**: Integrated PARSeq model for reading resistor, capacitor, inductor values, and voltage/current specifications.
 - **Smart Designation & Value Binding**: Automatically pairs designator labels (`R1`, `V1`, `LED1`) with electrical ratings (`220Ω`, `5V`, `10k`, `100mH`).
 - **Topology-Aware Circuit Reconstruction**:
-  - **Single-Loop Circuits**: Source on left rail $\rightarrow$ series passives on top rail $\rightarrow$ return rail with ground reference.
-  - **Multi-Branch Parallel Ladders**: Aligns RLC branches across common left and right bus rails with junction dots (`●`).
+  - Uses detected component terminals and wire-net membership to connect components.
+  - CAD renders only inferred nets; it does not add assumed series connections or ground rails.
 - **Standardized Vector CAD Schematics**: Exports IEEE electronic schematics in Dark CAD, Light Blueprint, and Schemdraw textbook formats.
-- **SPICE Netlist Synthesis**: Produces standard SPICE simulation decks with model directives (`.MODEL DLED_AUTO`, `.MODEL D1N4148`, `.TRAN`, `.OP`).
-- **Interactive Web Studio**: Real-time web interface for dragging & dropping sketches, viewing component bounding boxes, inspecting crop images, and downloading netlists.
+- **SPICE Netlist Synthesis**: Upload results preserve inferred node names and mark unreadable values as `VALUE_REQUIRED` rather than guessing values.
+- **Interactive Web Studio**: Uploads run the full component, OCR, wire, and connectivity pipeline. Detected values can be edited and the schematic/SPICE output regenerated; the grounded assistant can calculate passive values when the required electrical inputs are supplied.
+- **Grounded Circuit Assistant**: Without an LLM, it answers supported questions from detected components, connections, validation findings, and supplied calculation values. For open-ended conversational answers, configure `GROQ_API_KEY`, `OPENAI_API_KEY`, or `LLM_API_KEY` in `.env`; a local OpenAI-compatible server can instead use `LLM_BASE_URL` and `LLM_MODEL` (for example, an Ollama server at `http://localhost:11434/v1`).
+- **Honest SPICE Export**: Missing component values are marked as required instead of silently substituting guessed values; such netlists are not simulation-ready until values are supplied.
+
+Uploaded images without curated ground truth use the full topology pipeline, so CPU processing takes longer than component-only detection.
 
 ---
 
@@ -91,6 +95,25 @@ python main.py --port 8080      # Run on custom port
 python main.py --no-browser     # Run in headless/server mode
 python main.py --mcp            # Launch official Model Context Protocol (MCP) server
 ```
+
+### Connect an MCP client
+
+The workspace includes a VS Code MCP configuration at `.vscode/mcp.json`. Open this
+repository in VS Code and start the `papertocad` server from the MCP servers view.
+The server uses stdio and exposes tools to process a local sketch end to end,
+inspect and validate circuits, render schematics, export SPICE netlists, simulate
+circuits, and explain circuit topology.
+
+Use the `process_sketch` tool with an absolute image path, for example
+`D:\Projects\circuits\my_sketch.png`. It runs the full CV pipeline and saves
+each run's inputs, intermediate files, logs, reconstructed graph, schematic, and
+SPICE netlist under `outputs/mcp_jobs/<job-id>/`. The required YOLO, PARSeq, and
+HAWP model weights must be installed first; see `scripts/download_weights.py`.
+The pipeline uses CUDA when available and otherwise runs on CPU.
+
+The MCP Python SDK requires Python 3.10 or newer. Install the project requirements
+with that interpreter before starting the server. The Conda reproduction
+environment remains pinned to Python 3.9 and does not support the MCP server.
    - **Explore View Modes**:
      - **Computerized CAD Schematic**: Clean, IEEE-standardized orthogonal CAD vector drawing with Dark / Light Blueprint themes.
      - **Schemdraw**: Normalized textbook-grade electronic circuit diagram.

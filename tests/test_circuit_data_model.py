@@ -89,6 +89,54 @@ class TestCircuitDataModel(unittest.TestCase):
         self.assertEqual(len(final_json["components"]), 8)
         self.assertEqual(len(final_json["nets"]), len(graph.nodes))
 
+    def test_wire_edges_resolve_endpoint_ids_to_points_and_nets(self):
+        graph = CircuitGraph.from_final_json({
+            "image": "wire_mapping",
+            "width": 100,
+            "height": 80,
+            "components": [],
+            "points": [
+                {"id": 3, "x": 12, "y": 24},
+                {"id": 8, "x": 72, "y": 24},
+            ],
+            "endpoints": [
+                {"eid": 10, "point_id": 3, "kind": "node"},
+                {"eid": 11, "point_id": 8, "kind": "node"},
+            ],
+            "edges": [{"eid1": 10, "eid2": 11, "dist": 60, "ratio": 1.0}],
+            "nets": [{"id": 4, "endpoint_eids": [10, 11], "component_ids": []}],
+        })
+
+        self.assertEqual(len(graph.wires), 1)
+        self.assertEqual(
+            (graph.wires[0].start_x, graph.wires[0].start_y, graph.wires[0].end_x, graph.wires[0].end_y),
+            (12.0, 24.0, 72.0, 24.0),
+        )
+        self.assertEqual(graph.wires[0].node_id, 4)
+
+    def test_wire_segments_use_snapped_endpoint_coordinates(self):
+        graph = CircuitGraph.from_final_json({
+            "image": "snapped_wire_mapping",
+            "width": 100,
+            "height": 80,
+            "components": [],
+            "points": [
+                {"id": 3, "x": 12, "y": 24},
+                {"id": 8, "x": 72, "y": 24},
+            ],
+            "endpoints": [
+                {"eid": 10, "point_id": 3, "kind": "node", "x": 16.0, "y": 28.0},
+                {"eid": 11, "point_id": 8, "kind": "node", "x": 68.0, "y": 20.0},
+            ],
+            "edges": [{"eid1": 10, "eid2": 11, "dist": 60, "ratio": 1.0}],
+            "nets": [{"id": 4, "endpoint_eids": [10, 11], "component_ids": []}],
+        })
+
+        self.assertEqual(
+            (graph.wires[0].start_x, graph.wires[0].start_y, graph.wires[0].end_x, graph.wires[0].end_y),
+            (16.0, 28.0, 68.0, 20.0),
+        )
+
     def test_all_sample_circuits(self):
         json_dir = REPO_ROOT / "outputs" / "run1" / "final_result" / "json"
         for json_file in sorted(json_dir.glob("*.final.json")):

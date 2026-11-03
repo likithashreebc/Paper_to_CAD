@@ -24,7 +24,7 @@ os.makedirs(OUT_JSON, exist_ok=True)
 
 # ========= 超参数==========
 MAX_SEARCH_DIST = None      # 自适应(按图像大小); 若设为数字则强制使用该半径
-SEARCH_DIST_SCALE = 0.40  # max_dist = diag * scale
+SEARCH_DIST_SCALE = 0.65  # allow long, visually supported wire runs
 SEARCH_DIST_MIN   = 250.0 # 下限(小图也要能连上)
 SEARCH_DIST_MAX   = 4000.0 # 上限(防止大图候选爆炸)
 NEAR_K          = 120        # 每个点只看最近 K 个候选（提速 + 稳定）
@@ -124,7 +124,74 @@ def repair_wire_mask_for_cc(wire_img):
 # -------------------------------------------------
 # 构建端点列表（保持原来的结构）
 # -------------------------------------------------
-def build_endpoints(points):
+def build_endpoints(points, components=None):
+    points = list(points)
+    if components:
+        component_terminal_matches = {}
+        for point in points:
+            if point.get("type") != "component_terminal":
+                continue
+            for match in point.get("matches", []):
+                try:
+                    comp_id = int(match["comp_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                component_terminal_matches.setdefault(comp_id, []).append((point, match))
+
+        next_point_id = max((int(point.get("id", -1)) for point in points), default=-1) + 1
+        for component in components:
+            cls_name = str(component.get("cls_name", "")).lower()
+            if "diode" not in cls_name and "led" not in cls_name:
+                continue
+            try:
+                comp_id = int(component["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            terminals = component_terminal_matches.get(comp_id, [])
+            if len(terminals) != 1:
+                continue
+            point, match = terminals[0]
+            bbox = component.get("bbox", [])
+            if len(bbox) != 4:
+                continue
+
+            side = match.get("side")
+            x1, y1, x2, y2 = (float(value) for value in bbox)
+            x, y = float(point["x"]), float(point["y"])
+            if side == "top":
+                missing_side, x, y = "bottom", x, y2
+            elif side == "bottom":
+                missing_side, x, y = "top", x, y1
+            elif side == "left":
+                missing_side, x, y = "right", x2, y
+            elif side == "right":
+                missing_side, x, y = "left", x1, y
+            elif (y2 - y1) >= (x2 - x1):
+                missing_side = "bottom" if abs(y - y1) < abs(y - y2) else "top"
+                y = y2 if missing_side == "bottom" else y1
+            else:
+                missing_side = "right" if abs(x - x1) < abs(x - x2) else "left"
+                x = x2 if missing_side == "right" else x1
+
+            points.append({
+                "id": next_point_id,
+                "type": "component_terminal",
+                "x": x,
+                "y": y,
+                "inferred_terminal": True,
+                "inferred_connect_radius": max(8.0, min(16.0, 0.35 * min(x2 - x1, y2 - y1))),
+                "matches": [{
+                    "comp_id": comp_id,
+                    "cls_id": match.get("cls_id", component.get("cls_id")),
+                    "cls_name": match.get("cls_name", component.get("cls_name")),
+                    "side": missing_side,
+                    "edge_dist": 0.0,
+                }],
+            })
+            component_terminal_matches.setdefault(comp_id, []).append((points[-1], points[-1]["matches"][0]))
+            next_point_id += 1
+
     endpoints = []
     terminal_indices = []
     node_indices = []
@@ -161,6 +228,8 @@ def build_endpoints(points):
                 "cls_name": m["cls_name"],
                 "side": m["side"],
                 "edge_dist": float(m["edge_dist"]),
+                "inferred_terminal": bool(p.get("inferred_terminal", False)),
+                "inferred_connect_radius": float(p.get("inferred_connect_radius", 0.0)),
             })
             terminal_indices.append(eid)
             eid += 1
@@ -456,6 +525,29 @@ def angle_conflict(existing_angles, new_angle, min_sep):
             return True
     return False
 
+def segment_crosses_component(ax, ay, bx, by, component_terminals, radius=3.0):
+    dx = bx - ax
+    dy = by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq < 1e-6:
+        return False
+
+    for terminals in component_terminals.values():
+        interior_pins = 0
+        for terminal in terminals:
+            tx = float(terminal["x"]) - ax
+            ty = float(terminal["y"]) - ay
+            along = (tx * dx + ty * dy) / length_sq
+            if not 0.02 < along < 0.98:
+                continue
+            closest_x = ax + along * dx
+            closest_y = ay + along * dy
+            if math.hypot(float(terminal["x"]) - closest_x, float(terminal["y"]) - closest_y) <= radius:
+                interior_pins += 1
+                if interior_pins >= 2:
+                    return True
+    return False
+
 def compute_connect_radius_from_image(wire_img):
     H, W = wire_img.shape[:2]
     m = min(H, W)
@@ -662,6 +754,11 @@ def connect_by_nearest(endpoints, wire_img, max_search_dist, base_ratio=None):
 
     # 预提坐标
     coords = [(e["eid"], e["x"], e["y"], e["kind"]) for e in endpoints]
+    component_terminals = {}
+    for endpoint in endpoints:
+        comp_id = endpoint.get("comp_id")
+        if endpoint["kind"] == "terminal" and comp_id is not None:
+            component_terminals.setdefault(comp_id, []).append(endpoint)
 
     def max_deg(kind):
         return TERMINAL_MAX_DEGREE if kind == "terminal" else NODE_MAX_DEGREE
@@ -694,9 +791,24 @@ def connect_by_nearest(endpoints, wire_img, max_search_dist, base_ratio=None):
             bkind = ep[oeid]["kind"]
             if deg[oeid] >= max_deg(bkind):
                 continue
+            if (
+                akind == "terminal"
+                and bkind == "terminal"
+                and ep[eid].get("comp_id") == ep[oeid].get("comp_id")
+            ):
+                continue
 
             a, b = (eid, oeid) if eid < oeid else (oeid, eid)
             if (a, b) in edge_pairs:
+                continue
+            if segment_crosses_component(
+                ax,
+                ay,
+                ep[oeid]["x"],
+                ep[oeid]["y"],
+                component_terminals,
+                radius=max(3.0, float(CONNECT_RADIUS)),
+            ):
                 continue
 
             # ✅ 角度间隔冲突检查（约束 node + component terminal）
@@ -710,40 +822,65 @@ def connect_by_nearest(endpoints, wire_img, max_search_dist, base_ratio=None):
                 if angle_conflict(used_angles[oeid], th_b, min_sep):
                     continue
 
-            # 连通率裁决（主判据）
-            # 1) ✅ 连通域判定：若两点吸附到同一白色连通域，则直接认为连通
-            if USE_CC_CONNECT and CC_BUILD_TREE and cc_connected(ep[eid], ep[oeid]):
-                # 同一连通域内的连线交给 cc_tree 统一生成（避免两两乱连）
-                continue
+            inferred_link = (
+                ep[eid].get("inferred_terminal")
+                or ep[oeid].get("inferred_terminal")
+            ) and dist <= max(
+                float(ep[eid].get("inferred_connect_radius", 0.0)),
+                float(ep[oeid].get("inferred_connect_radius", 0.0)),
+            )
+            if inferred_link:
+                ratio = 1.0
+                dir_name = "inferred"
             else:
-                # 2) 回退：两点不在同一连通域
-                #    - 若两点都吸附到了“有效连通域”但 label 不同：优先防止误连
-                la = int(ep[eid].get("cc_label", 0))
-                lb = int(ep[oeid].get("cc_label", 0))
-                if CROSS_CC_STRICT and (la != 0) and (lb != 0) and (la != lb):
-                    # 允许做一次“轻微膨胀 + ROI 连通性”检查，修复因断线导致的 CC 分裂
-                    if float(dist) <= float(BRIDGE_MAX_DIST):
-                        ok = bridge_connected_by_dilate(
-                            wire_img, ax, ay, ep[oeid]["x"], ep[oeid]["y"],
-                            dilate_r=BRIDGE_DILATE_R, margin=BRIDGE_MARGIN,
-                            max_roi_area=BRIDGE_MAX_ROI_AREA
-                        )
-                        if ok:
-                            ratio = 1.5  # 标记为 bridge 连接（可视化时会显示 1.50）
-                            dir_name = "bridge"
+                line_radius = max(
+                    CONNECT_RADIUS,
+                    min(4, int(round(float(dist) * 0.008))),
+                )
+
+                # 连通率裁决（主判据）
+                # 1) ✅ 连通域判定：若两点吸附到同一白色连通域，则直接认为连通
+                if USE_CC_CONNECT and CC_BUILD_TREE and cc_connected(ep[eid], ep[oeid]):
+                    # 同一连通域内的连线交给 cc_tree 统一生成（避免两两乱连）
+                    continue
+                else:
+                    # 2) 回退：两点不在同一连通域
+                    #    - 若两点都吸附到了“有效连通域”但 label 不同：优先防止误连
+                    la = int(ep[eid].get("cc_label", 0))
+                    lb = int(ep[oeid].get("cc_label", 0))
+                    if CROSS_CC_STRICT and (la != 0) and (lb != 0) and (la != lb):
+                        # 允许做一次“轻微膨胀 + ROI 连通性”检查，修复因断线导致的 CC 分裂
+                        if float(dist) <= float(BRIDGE_MAX_DIST):
+                            ok = bridge_connected_by_dilate(
+                                wire_img, ax, ay, ep[oeid]["x"], ep[oeid]["y"],
+                                dilate_r=BRIDGE_DILATE_R, margin=BRIDGE_MARGIN,
+                                max_roi_area=BRIDGE_MAX_ROI_AREA
+                            )
+                            if ok:
+                                ratio = 1.5  # 标记为 bridge 连接（可视化时会显示 1.50）
+                                dir_name = "bridge"
+                            else:
+                                # Separate CC labels can still be joined by a clearly
+                                # supported wire path when a small image gap splits it.
+                                ratio = sample_line_connectivity(
+                                    wire_img, ax, ay, ep[oeid]["x"], ep[oeid]["y"],
+                                    radius=line_radius
+                                )
+                                ratio_th = adaptive_ratio_th(dist, max_search_dist, base=base_ratio)
+                                if ratio < ratio_th:
+                                    continue
+                                dir_name = "nearest"
                         else:
                             continue
                     else:
-                        continue
-                else:
-                    # 正常回退：沿 A-B 直线采样命中白像素比例（原逻辑）
-                    ratio = sample_line_connectivity(
-                        wire_img, ax, ay, ep[oeid]["x"], ep[oeid]["y"], radius=CONNECT_RADIUS
-                    )
-                    ratio_th = adaptive_ratio_th(dist, max_search_dist, base=base_ratio)
-                    if ratio < ratio_th:
-                        continue
-                    dir_name = "nearest"
+                        # 正常回退：沿 A-B 直线采样命中白像素比例（原逻辑）
+                        ratio = sample_line_connectivity(
+                            wire_img, ax, ay, ep[oeid]["x"], ep[oeid]["y"], radius=line_radius
+                        )
+                        ratio_th = adaptive_ratio_th(dist, max_search_dist, base=base_ratio)
+                        if ratio < ratio_th:
+                            continue
+                        dir_name = "nearest"
 
 
             # 建边：字段保持和旧版一致（phase/dir/dist/ratio 都有）
@@ -926,7 +1063,7 @@ def main():
         print(f"\n=== Processing {name} ===")
         _, points, comps = load_merged_json(jpath)
 
-        endpoints, _, _ = build_endpoints(points)
+        endpoints, _, _ = build_endpoints(points, comps)
 
         # ===== NEW: 端点吸附到白线连通域（减少“点偏/弯线/细线”导致的漏连）=====
         wire_img_for_cc = wire_img

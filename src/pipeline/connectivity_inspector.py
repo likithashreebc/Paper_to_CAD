@@ -199,9 +199,10 @@ class ConnectivityInspector:
         """
         if action == "update_value":
             cid = params.get("comp_id")
-            val = params.get("value", "").strip()
-            if cid is None or not val:
+            value = params.get("value")
+            if cid is None or value is None:
                 return False, "Missing comp_id or value"
+            val = str(value).strip()
             ok = self.graph.update_component_value(int(cid), val)
             return ok, f"Updated value of component #{cid} to '{val}'" if ok else f"Component #{cid} not found"
 
